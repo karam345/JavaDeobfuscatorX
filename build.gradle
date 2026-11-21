@@ -1,0 +1,75 @@
+plugins {
+    id 'application'
+}
+
+group = 'org.javadeobfuscatorx'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.ow2.asm:asm-tree:9.10.1'
+    implementation 'org.ow2.asm:asm-util:9.10.1'
+    implementation 'org.ow2.asm:asm-analysis:9.10.1'
+    implementation 'org.vineflower:vineflower:1.12.0'
+    implementation 'org.benf:cfr:0.152'
+    implementation 'org.snakeyaml:snakeyaml-engine:2.10'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.12.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.12.2'
+}
+
+application {
+    mainClass = 'org.javadeobfuscatorx.Main'
+    applicationName = 'jdx'
+    applicationDefaultJvmArgs = ['-Xmx768m', '-Dfile.encoding=UTF-8']
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+    options.encoding = 'UTF-8'
+}
+
+test {
+    useJUnitPlatform()
+    systemProperty 'jdx.testClasspath', sourceSets.main.runtimeClasspath.asPath
+}
+
+distributions {
+    main {
+        distributionBaseName = 'javadeobfuscatorx'
+        contents {
+            from('LICENSE', 'THIRD_PARTY.md')
+            from('licenses') { into 'licenses' }
+        }
+    }
+}
+
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+tasks.register('benchmark', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'org.javadeobfuscatorx.Benchmark'
+    maxHeapSize = '768m'
+}
+
+tasks.register('skillZip', Zip) {
+    dependsOn installDist
+    archiveFileName = 'java-deobfuscation-' + project.version + '.zip'
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+    into('java-deobfuscation') {
+        from('skills/java-deobfuscation')
+        from('LICENSE')
+        into('runtime') { from(installDist.destinationDir) }
+    }
+}

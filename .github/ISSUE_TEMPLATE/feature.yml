@@ -1,0 +1,11 @@
+name: Feature request
+description: Describe an analysis, reconstruction or skill workflow
+title: "[Feature] "
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Workflow and expected result
+      description: Explain the input, the current limitation and what a successful result would look like.
+    validations:
+      required: true

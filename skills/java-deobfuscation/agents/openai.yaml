@@ -1,0 +1,7 @@
+interface:
+  display_name: "JavaDeobfuscatorX"
+  short_description: "Analyze and reconstruct Java JARs locally"
+  default_prompt: "Use $java-deobfuscation to inspect this JAR and recover readable Java source."
+
+policy:
+  allow_implicit_invocation: true

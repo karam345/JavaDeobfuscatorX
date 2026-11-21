@@ -1,0 +1,11 @@
+/.gradle/
+/.gradle-local/
+/build/
+/out/
+/.idea/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.zip
+*.jfr
+.env*

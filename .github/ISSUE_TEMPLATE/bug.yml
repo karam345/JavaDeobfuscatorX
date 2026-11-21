@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible problem with the CLI or skill
+title: "[Bug] "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: JavaDeobfuscatorX version, OS and Java version
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Include the command, expected behavior and actual result. Use synthetic fixtures and redact sensitive information.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Relevant report excerpts
+      description: Share only evidence you are authorized to publish.
