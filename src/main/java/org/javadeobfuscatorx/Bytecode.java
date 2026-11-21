@@ -1,7 +1,10 @@
 package org.javadeobfuscatorx;
 
 import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.MethodNode;
@@ -13,10 +16,13 @@ import org.objectweb.asm.tree.analysis.Frame;
 import org.objectweb.asm.util.CheckClassAdapter;
 
 import java.util.Map;
+import java.util.HashMap;
 import java.util.TreeMap;
 
 final class Bytecode {
+    private static final int PASSES = 6;
     record Result(byte[] bytes, Map<String, Integer> changes, String rollback) {}
+    private record MethodKey(String name, String descriptor) {}
 
     static ClassNode parse(byte[] bytes) {
         var node = new ClassNode();
@@ -28,7 +34,7 @@ final class Bytecode {
         verify(parse(bytes));
     }
 
-    private static void verify(ClassNode node) throws AnalyzerException {
+    static void verify(ClassNode node) throws AnalyzerException {
         for (MethodNode method : node.methods) {
             checkBudget(method);
         }
@@ -40,13 +46,22 @@ final class Bytecode {
         return new Analyzer<>(new BasicVerifier()).analyze(owner, method);
     }
 
-    private static void checkBudget(MethodNode method) throws AnalyzerException {
+    static void checkBudget(MethodNode method) throws AnalyzerException {
         long instructions = method.instructions.size();
         long slots = (long) method.maxLocals + method.maxStack + 1;
         if (instructions * slots > 2_000_000
                 || instructions * method.tryCatchBlocks.size() > 2_000_000
                 || (long) method.maxLocals < parameterSlots(method)) {
             throw new AnalyzerException(null, "Method exceeds static verification budget or has invalid locals");
+        }
+        for (var instruction : method.instructions) {
+            if (instruction instanceof org.objectweb.asm.tree.LookupSwitchInsnNode lookup) {
+                for (int i = 1; i < lookup.keys.size(); i++) {
+                    if (lookup.keys.get(i - 1) >= lookup.keys.get(i)) {
+                        throw new AnalyzerException(instruction, "LOOKUPSWITCH keys are not strictly increasing");
+                    }
+                }
+            }
         }
     }
 
@@ -62,46 +77,68 @@ final class Bytecode {
     }
 
     static Result transform(byte[] original, Hierarchy hierarchy) {
+        try {
+            return transform(original, parse(original), hierarchy);
+        } catch (RuntimeException | StackOverflowError failure) {
+            return new Result(original, Map.of(), Inspection.failure(failure));
+        }
+    }
+
+    static Result transform(byte[] original, ClassNode node, Hierarchy hierarchy) {
         var changes = new TreeMap<String, Integer>();
+        byte[] verified = original;
         try {
             // Keep custom attributes and legacy subroutines byte-for-byte.
-            var node = parse(original);
             if (node.attrs != null || node.fields.stream().anyMatch(field -> field.attrs != null)
                     || node.methods.stream().anyMatch(method -> method.attrs != null)) {
                 return new Result(original, Map.of(), "Custom attributes");
             }
             verify(node);
-            boolean controlFlowChanged = false;
-            for (MethodNode method : node.methods) {
-                if (method.instructions.size() == 0) {
-                    continue;
-                }
-                var counts = Rewrites.apply(method, node.version & 0xffff);
-                boolean simplified = counts.containsKey("constant branch") || counts.containsKey("constant switch");
-                controlFlowChanged |= simplified || counts.containsKey("redundant jump");
-                counts.forEach((key, value) -> changes.merge(key, value, Integer::sum));
-                if (simplified) {
-                    int removed = Rewrites.prune(node.name, method);
-                    if (removed != 0) {
-                        changes.merge("unreachable instruction", removed, Integer::sum);
+            boolean flow = (node.version & 0xffff) >= 51;
+            for (int pass = 0; pass < PASSES; pass++) {
+                var replacements = new HashMap<MethodKey, MethodNode>();
+                var counts = new TreeMap<String, Integer>();
+                for (MethodNode method : node.methods) {
+                    var applied = Rewrites.apply(node.name, method, flow);
+                    if (!applied.isEmpty()) {
+                        replacements.put(new MethodKey(method.name, method.desc), method);
+                        applied.forEach((key, value) -> counts.merge(key, value, Integer::sum));
                     }
                 }
+                if (replacements.isEmpty()) break;
+                byte[] candidate = write(verified, replacements, hierarchy, counts.keySet().stream().anyMatch(
+                        change -> change.contains("jump") || change.contains("branch") || change.contains("switch")
+                                || change.contains("handler") || change.equals("unreachable instruction")) && flow);
+                node = parse(candidate);
+                verify(node);
+                verified = candidate;
+                counts.forEach((key, value) -> changes.merge(key, value, Integer::sum));
             }
-            if (changes.isEmpty()) {
-                return new Result(original, Map.of(), null);
-            }
-            var writer = new ClassWriter(controlFlowChanged ? ClassWriter.COMPUTE_FRAMES : ClassWriter.COMPUTE_MAXS) {
-                @Override
-                protected String getCommonSuperClass(String left, String right) {
-                    return hierarchy.common(left, right);
-                }
-            };
-            node.accept(writer);
-            byte[] candidate = writer.toByteArray();
-            verify(candidate);
-            return new Result(candidate, changes, null);
+            return new Result(verified, changes, null);
         } catch (AnalyzerException | RuntimeException | StackOverflowError failure) {
-            return new Result(original, Map.of(), Inspection.failure(failure));
+            return new Result(verified, changes, Inspection.failure(failure));
         }
+    }
+
+    private static byte[] write(byte[] input, Map<MethodKey, MethodNode> replacements, Hierarchy hierarchy,
+                                boolean computeFrames) {
+        var reader = new ClassReader(input);
+        var writer = new ClassWriter(reader, computeFrames ? ClassWriter.COMPUTE_FRAMES : ClassWriter.COMPUTE_MAXS) {
+            @Override
+            protected String getCommonSuperClass(String left, String right) {
+                return hierarchy.common(left, right);
+            }
+        };
+        reader.accept(new ClassVisitor(Opcodes.ASM9, writer) {
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
+                MethodVisitor output = super.visitMethod(access, name, descriptor, signature, exceptions);
+                MethodNode replacement = replacements.get(new MethodKey(name, descriptor));
+                if (replacement == null) return output;
+                replacement.accept(output);
+                return null;
+            }
+        }, 0);
+        return writer.toByteArray();
     }
 }

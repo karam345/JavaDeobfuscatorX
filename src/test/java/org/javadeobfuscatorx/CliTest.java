@@ -65,6 +65,78 @@ class CliTest {
     }
 
     @Test
+    void exportsGradleProjectAndRecognizesModLoaderMetadata() throws Exception {
+        byte[] fabric = """
+                {"schemaVersion":1,"id":"demo","version":"1.0","depends":{"fabricloader":"*"},
+                 "entrypoints":{"main":["sample.Demo::value"]},"mixins":["demo.mixins.json"]}
+                """.getBytes(StandardCharsets.UTF_8);
+        var jar = Fixtures.jar(temp.resolve("mod.jar"), Map.of(
+                "WEB-INF/classes/sample/Demo.class", Fixtures.marker("sample/Demo", 21),
+                "fabric.mod.json", fabric,
+                "META-INF/mods.toml", "modLoader=\"javafml\"\n".getBytes(StandardCharsets.UTF_8),
+                "META-INF/neoforge.mods.toml", "modLoader=\"javafml\"\n".getBytes(StandardCharsets.UTF_8),
+                "WEB-INF/classes/demo.mixins.json", "{}".getBytes(StandardCharsets.UTF_8),
+                "META-INF/OLD.SF", "Signature-Version: 1.0".getBytes(StandardCharsets.UTF_8)));
+        Path output = temp.resolve("project-export");
+        var result = run("decompile", jar.toString(), "--out", output.toString(), "--compile", "--project");
+        assertEquals(0, result.code, result.log);
+        assertArrayEquals(fabric, Files.readAllBytes(output.resolve("project/src/main/resources/fabric.mod.json")));
+        assertTrue(Files.isRegularFile(output.resolve("project/src/main/resources/META-INF/mods.toml")));
+        assertTrue(Files.isRegularFile(output.resolve("project/src/main/resources/META-INF/neoforge.mods.toml")));
+        assertTrue(Files.isRegularFile(output.resolve("project/src/main/resources/demo.mixins.json")));
+        assertTrue(Files.isRegularFile(output.resolve("project/src/main/java/sample/Demo.java")));
+        assertFalse(Files.exists(output.resolve("project/src/main/resources/META-INF/OLD.SF")));
+        assertTrue(Files.readString(output.resolve("project/build.gradle")).contains("options.release = 21"));
+        assertTrue(Files.readString(output.resolve("minecraft.tsv")).contains("mod entrypoint\tsample/Demo\tpresent"));
+        try (var resources = new ZipFile(output.resolve("resources.zip").toFile())) {
+            assertNotNull(resources.getEntry("META-INF/OLD.SF"));
+        }
+    }
+
+    @Test
+    void distinguishesMissingDependencyFromSourceError() throws Exception {
+        Path sources = Files.createDirectory(temp.resolve("sources"));
+        Files.writeString(sources.resolve("Broken.java"), """
+                import fixture.unavailable.Api;
+                class Broken {
+                    Api api;
+                    int invalid = "text";
+                }
+                """);
+        Path output = temp.resolve("verification");
+        var result = run("verify", "--sources", sources.toString(), "--source-release", "17", "--out", output.toString());
+        assertEquals(3, result.code, result.log);
+        String details = Files.readString(output.resolve("javac-provided.tsv"));
+        assertTrue(details.contains("missing-dependency\tBroken.java\tcompiler.err.doesnt.exist"), details);
+        assertTrue(details.contains("compilation\tBroken.java\tcompiler.err.prob.found.req"), details);
+    }
+
+    @Test
+    void compilesModuleWithStagedNamedAndFilenameDerivedDependencies() throws Exception {
+        Path named = Fixtures.jar(temp.resolve("renamed.jar"), Map.of(
+                "META-INF/MANIFEST.MF", ("Manifest-Version: 1.0\r\n"
+                        + "Automatic-Module-Name: fixture.named\r\nClass-Path: missing.jar\r\n\r\n")
+                        .getBytes(StandardCharsets.UTF_8),
+                "fixture/named/Named.class", Fixtures.marker("fixture/named/Named", 7)));
+        Path implicit = Fixtures.jar(temp.resolve("fixture-implicit-1.0.jar"),
+                Map.of("fixture/implicit/Implicit.class", Fixtures.marker("fixture/implicit/Implicit", 8)));
+        Path source = Files.createDirectory(temp.resolve("src"));
+        Files.writeString(source.resolve("module-info.java"),
+                "module fixture.consumer { requires fixture.named; requires fixture.implicit; }");
+        Path packageRoot = Files.createDirectories(source.resolve("fixture/consumer"));
+        Files.writeString(packageRoot.resolve("UsesModules.java"), """
+                package fixture.consumer;
+                class UsesModules {
+                    int value() { return fixture.named.Named.value() + fixture.implicit.Implicit.value(); }
+                }
+                """);
+        var result = run("verify", "--sources", source.toString(), "--classpath", named.toString(),
+                "--classpath", implicit.toString(), "--out", temp.resolve("modular").toString());
+        assertEquals(0, result.code, result.log);
+        assertTrue(result.log.contains("javac provided: passed"), result.log);
+    }
+
+    @Test
     void inspectionCommandsDoNotProduceSourceOrRewriteTheInput() throws Exception {
         var jar = Fixtures.jar(temp.resolve("plain.jar"), Map.of("sample/A.class", Fixtures.marker("sample/A", 1)));
         byte[] original = Files.readAllBytes(jar);

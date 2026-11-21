@@ -105,6 +105,14 @@ class EngineTest implements Opcodes {
             var result = Bytecode.transform(original, new Hierarchy(archive));
             assertSame(original, result.bytes());
             assertTrue(result.rollback().contains("Missing hierarchy"), result.rollback());
+            var dependency = Fixtures.jar(temp.resolve("hierarchy.jar"), Map.of(
+                    "missing/Left.class", Fixtures.marker("missing/Left", 1),
+                    "missing/Right.class", Fixtures.marker("missing/Right", 2)));
+            try (var libraries = new DecompilerWorker.Libraries(java.util.List.of(dependency))) {
+                var resolved = Bytecode.transform(original, new Hierarchy(archive, libraries));
+                assertNull(resolved.rollback(), resolved.rollback());
+                assertEquals(1, resolved.changes().get("constant branch"));
+            }
         }
     }
 

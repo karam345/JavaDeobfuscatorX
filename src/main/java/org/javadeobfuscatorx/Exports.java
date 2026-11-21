@@ -19,34 +19,60 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 final class Exports {
-    record Staged(int classes, Map<String, Integer> changes, List<String> rollbacks) {}
+    record Staged(int classes, Map<String, Integer> changes, List<String> rollbacks, SourceInventory inventory) {}
     record SourceRun(int files, String status, int code) {}
 
     static Staged stage(Archive archive, Path output, boolean rewrite) throws IOException {
+        return stage(archive, output, rewrite, List.of());
+    }
+
+    static Staged stage(Archive archive, Path output, boolean rewrite, List<Path> dependencies) throws IOException {
+        return stage(archive, output, rewrite, dependencies, false);
+    }
+
+    private static Staged stage(Archive archive, Path output, boolean rewrite, List<Path> dependencies,
+                                boolean library) throws IOException {
         var changes = new TreeMap<String, Integer>();
         var rollbacks = new ArrayList<String>();
-        var hierarchy = new Hierarchy(archive);
+        var inventory = new SourceInventory();
         int classes = 0;
-        try (var zip = new ZipOutputStream(Files.newOutputStream(output))) {
+        try (var zip = new ZipOutputStream(Files.newOutputStream(output));
+             var libraries = new DecompilerWorker.Libraries(dependencies)) {
+            if (library) writeModuleIdentity(zip, archive);
+            var hierarchy = new Hierarchy(archive, libraries);
             for (var entry : archive.selected.values()) {
                 byte[] data = archive.read(entry.entry());
+                org.objectweb.asm.tree.ClassNode node;
                 try {
-                    Bytecode.parse(data);
+                    node = Bytecode.parse(data);
                 } catch (RuntimeException | StackOverflowError invalid) {
                     rollbacks.add(Inspection.row(entry.name(), "Unparseable class, excluded from staged view"));
                     continue;
                 }
                 if (rewrite) {
-                    var result = Bytecode.transform(data, hierarchy);
+                    var result = Bytecode.transform(data, node, hierarchy);
                     data = result.bytes();
                     if (result.rollback() != null) rollbacks.add(Inspection.row(entry.name(), result.rollback()));
                     result.changes().forEach((key, count) -> changes.merge(key, count, Integer::sum));
                 }
                 put(zip, entry.path(), data);
+                inventory.add(node);
                 classes++;
             }
         }
-        return new Staged(classes, changes, rollbacks);
+        return new Staged(classes, changes, rollbacks, inventory);
+    }
+
+    private static void writeModuleIdentity(ZipOutputStream zip, Archive archive) throws IOException {
+        String name = archive.manifest.getMainAttributes().getValue("Automatic-Module-Name");
+        if (name == null || name.length() > 1024 || !javax.lang.model.SourceVersion.isName(name)) return;
+        var manifest = new java.util.jar.Manifest();
+        var attributes = manifest.getMainAttributes();
+        attributes.put(java.util.jar.Attributes.Name.MANIFEST_VERSION, "1.0");
+        attributes.putValue("Automatic-Module-Name", name);
+        var content = new java.io.ByteArrayOutputStream();
+        manifest.write(content);
+        put(zip, "META-INF/MANIFEST.MF", content.toByteArray());
     }
 
     static void resources(Archive archive, Path output) throws IOException {
@@ -74,8 +100,11 @@ final class Exports {
                     total += entry.entry().getSize();
                 }
                 if (total > limits.totalBytes()) throw new IOException("Combined classpath exceeds expanded byte limit.");
-                Path stage = work.resolve("dependency-" + dependencies.size() + ".jar");
-                stage(archive, stage, false);
+                Path folder = Files.createDirectory(work.resolve("dependency-" + dependencies.size()));
+                String name = input.getFileName().toString();
+                Archive.checkName(name);
+                Path stage = folder.resolve(name.endsWith(".jar") ? name : name + ".jar");
+                stage(archive, stage, false, List.of(), true);
                 dependencies.add(stage);
             }
         }
@@ -143,7 +172,7 @@ final class Exports {
                 process.waitFor(5, TimeUnit.SECONDS);
             }
         }
-        int units = mode.equals("compile") ? 0 : sourceFiles(output).size();
+        int units = mode.equals("compile") || mode.equals("syntax") ? 0 : sourceFiles(output).size();
         if (!finished) return new SourceRun(units, "timed out", 1);
         int code = process.exitValue();
         return new SourceRun(units, code == 0 ? "passed" : "failed or partial (worker exit " + code + ")", code);
@@ -167,11 +196,11 @@ final class Exports {
         }
     }
 
-    private static Map<String, Path> sourceFiles(Path directory) throws IOException {
+    static Map<String, Path> sourceFiles(Path directory) throws IOException {
         var files = new TreeMap<String, Path>();
         try (var stream = Files.walk(directory)) {
             for (Path path : stream.filter(file -> file.toString().endsWith(".java") && Files.isRegularFile(file)).toList()) {
-                files.put(directory.relativize(path).toString().replace(java.io.File.separatorChar, '/'), path);
+                files.put(SourceValidation.path(directory.relativize(path)), path);
             }
         }
         return files;

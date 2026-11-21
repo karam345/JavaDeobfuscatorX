@@ -13,11 +13,17 @@ final class Hierarchy {
     private static final String OBJECT = "java/lang/Object";
     private final Map<String, Header> headers = new HashMap<>();
     private final Archive archive;
+    private final DecompilerWorker.Libraries libraries;
 
     record Header(String parent, String[] interfaces, boolean isInterface) {}
 
     Hierarchy(Archive archive) {
+        this(archive, null);
+    }
+
+    Hierarchy(Archive archive, DecompilerWorker.Libraries libraries) {
         this.archive = archive;
+        this.libraries = libraries;
     }
 
     String common(String left, String right) {
@@ -38,6 +44,7 @@ final class Hierarchy {
         String parent = left;
         var seen = new HashSet<String>();
         while ((parent = header(parent).parent()) != null && seen.add(parent)) {
+            if (seen.size() > 256) throw new IllegalArgumentException("Class hierarchy exceeds analysis budget");
             if (assignable(parent, right)) return parent;
         }
         throw new IllegalArgumentException("Inconsistent class hierarchy");
@@ -56,12 +63,15 @@ final class Hierarchy {
         var pending = new ArrayDeque<String>();
         var seen = new HashSet<String>();
         pending.add(value);
+        int edges = 0;
         while (!pending.isEmpty()) {
             String current = pending.removeFirst();
             if (current.equals(target)) return true;
             if (!seen.add(current)) continue;
             if (seen.size() > 256) throw new IllegalArgumentException("Class hierarchy exceeds analysis budget");
             var header = header(current);
+            edges += 1 + header.interfaces().length;
+            if (edges > 8192) throw new IllegalArgumentException("Class hierarchy exceeds edge budget");
             if (header.parent() != null) pending.addLast(header.parent());
             for (String name : header.interfaces()) pending.addLast(name);
         }
@@ -83,11 +93,18 @@ final class Hierarchy {
     private Header readHeader(String name) {
         try {
             Archive.checkName(name + ".class");
+            if (name.startsWith("java/")) {
+                try (var input = ClassLoader.getPlatformClassLoader().getResourceAsStream(name + ".class")) {
+                    if (input != null) return header(new ClassReader(input));
+                }
+            }
             var entry = archive.selected.get(name);
             if (entry != null) return header(new ClassReader(archive.read(entry.entry())));
             try (var input = ClassLoader.getPlatformClassLoader().getResourceAsStream(name + ".class")) {
                 if (input != null) return header(new ClassReader(input));
             }
+            byte[] dependency = libraries == null ? null : libraries.find(name + ".class");
+            if (dependency != null) return header(new ClassReader(dependency));
         } catch (IOException failure) {
             throw new IllegalArgumentException("Cannot read hierarchy for " + name, failure);
         }

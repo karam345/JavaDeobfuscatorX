@@ -137,8 +137,8 @@ final class Archive implements AutoCloseable {
                     throw new IllegalArgumentException("Invalid multi-release directory");
                 }
                 path = path.substring(end + 1);
-            } else if (path.startsWith("BOOT-INF/classes/") || path.startsWith("WEB-INF/classes/")) {
-                path = path.substring("BOOT-INF/classes/".length());
+            } else {
+                path = classRootPath(path);
             }
             var reader = new ClassReader(bytes);
             String name = reader.getClassName();
@@ -151,6 +151,12 @@ final class Archive implements AutoCloseable {
         } catch (RuntimeException failure) {
             problems.add(entry.getName() + ": " + failure.getClass().getSimpleName());
         }
+    }
+
+    static String classRootPath(String path) {
+        if (path.startsWith("BOOT-INF/classes/")) return path.substring("BOOT-INF/classes/".length());
+        if (path.startsWith("WEB-INF/classes/")) return path.substring("WEB-INF/classes/".length());
+        return path;
     }
 
     static void checkName(String path) throws IOException {

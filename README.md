@@ -8,7 +8,7 @@ Get the CLI ZIP or the packaged skill from [GitHub Releases](https://github.com/
 
 ```sh
 bin/jdx analyze plugin.jar --out inspection
-bin/jdx deobfuscate plugin.jar --out recovered --compile --classpath paper-api.jar
+bin/jdx deobfuscate plugin.jar --out recovered --compile --project --classpath paper-api.jar
 bin/jdx compare plugin.jar --out comparison
 bin/jdx verify --sources recovered/sources --classpath paper-api.jar --out compile-check
 ```
@@ -36,23 +36,27 @@ Codex can select the skill for a matching natural-language request. Use `$java-d
 | `analyze` | Archive inventory, bytecode patterns, class references and Minecraft metadata |
 | `detect` | Same evidence with an obfuscation-focused skill response |
 | `report` | Same evidence exported as a text report and TSV files |
-| `decompile` | Vineflower Java source, CFR fallback on detected failure, original resources |
+| `decompile` | Java source, declaration and syntax checks, CFR recovery, and original resources |
 | `deobfuscate` | Verified rewrites of selected classes, reconstructed sources and original resources |
-| `compare` | Both source trees plus a file coverage and SHA-256 comparison |
+| `compare` | Both source trees, declaration coverage, syntax and optional compile diagnostics, and SHA-256 comparison |
 | `verify` | Static bytecode checks, javac with `--sources`, or both |
 | `help` | Exact flags and defaults |
 
 ## Capabilities
 
-- **Bytecode.** Folds constant integer arithmetic, shifts, bitwise expressions and narrowing. Resolves adjacent constant integer branches and switches, removes newly unreachable instructions, eliminates literal push/pop and simplifies redundant jumps. Verifies each changed class and rolls back on failure.
-- **Strings.** Decodes literal UTF-8 payloads passed to `Base64.getDecoder().decode(String)` for the report. Custom codecs and cipher implementations stay in source.
-- **Detection.** Reports short names, short wrappers, switch loops, exception handlers, reflection, crypto calls, synthetic methods and bootstrap patterns. Vendor attribution requires concrete metadata evidence and stays explicitly qualified.
-- **Source.** The decompilers reconstruct imports and format Java. `mappings.tsv` provides inferred names from plugin roles, field types and accessors. It preserves owners, member names, descriptors and confidence. Inferred names are suggestions for review.
-- **Minecraft.** Reads Bukkit-family, Paper, BungeeCord and Velocity descriptors. Reports entrypoints, permissions, commands, dependencies, listener annotations, Bukkit and Folia schedulers, Paper/Purpur/NMS references, PacketEvents and recognizable bundled libraries. `resources.zip` retains original resource bytes.
+- **Bytecode.** Propagates integer and long constants through locals, stack slots and control-flow joins. Simplifies proven predicates and switches, threads jumps, and removes unreachable instructions and shadowed handlers. Keeps the last verified pass on failure.
+- **Strings.** Recovers supported literal Base64 and hex payloads. Explicit `new String(bytes, charset)` patterns can become `new String(literal)` while retaining distinct object identity.
+- **Detection.** Reports forwarding and bridge methods, reflection and crypto calls, switch loops and static bootstrap references. Vendor attribution remains separate from general patterns.
+- **Source.** Checks expected declarations and parses the recovered Java. Auto mode tries CFR for incomplete output, chooses source units using diagnostics, and verifies combined output.
+- **Identifiers.** Repairs invalid local debug names consistently. `mappings.tsv` gives separate class and member name suggestions with confidence and original descriptors.
+- **Minecraft.** Reads Bukkit-family, Paper, BungeeCord, Velocity and Fabric descriptors. Recognizes Forge-family and NeoForge descriptors and `@Mod` annotations. Reports plugin and mod entrypoints.
+- **Projects.** `--project` exports an offline Gradle Java project with recovered source, resources and supplied classpath JARs. `resources.zip` retains original resource bytes and signatures.
 
 ### Verification and limitations
 
-`--compile` runs javac in a separate worker with annotation processing disabled and only staged dependency classes on the classpath. A passing source build does not establish equivalent behavior. `bytecode.jar` contains the flattened selected class view for offline inspection. Source comparison measures file presence and hashes.
+`--compile` runs javac in a separate worker with annotation processing disabled. It uses staged local dependencies on the classpath or module path as appropriate. Diagnostics distinguish missing dependencies, unresolved symbols and other compile errors. The source target comes from the selected classfile versions. Use `--source-release` to override it and `--release` to select a multi-release archive view.
+
+Successful parsing and compilation do not establish equivalent behavior. `bytecode.jar` contains the selected classes for offline inspection. Reconstructed mods can still require loader plugins, mappings and additional dependencies.
 
 Archive entries are size-bounded and checked for unsafe paths, duplicates and CRC errors. Decompilers and javac run in bounded JVM workers. See the [security policy](SECURITY.md) and [engine details and roadmap](docs/architecture.md) for the trust boundary and technique coverage.
 

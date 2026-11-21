@@ -10,8 +10,6 @@ import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.extern.IResultSaver;
 
-import javax.tools.JavaFileObject;
-import javax.tools.ToolProvider;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -42,8 +40,9 @@ public final class DecompilerWorker {
         var messages = new ArrayList<String>();
         int code = 0;
         try {
-            if (mode.equals("compile")) {
-                code = compile(input, output, args[4], dependencies, messages) ? 0 : 1;
+            if (mode.equals("compile") || mode.equals("syntax")) {
+                code = SourceValidation.run(mode.equals("syntax"), input, output, Integer.parseInt(args[4]),
+                        dependencies, messages) ? 0 : 1;
             } else {
                 var saver = new SourceSaver(output, messages);
                 switch (mode) {
@@ -113,13 +112,8 @@ public final class DecompilerWorker {
                 public Pair<byte[], String> getClassFileContent(String path) throws IOException {
                     Archive.checkName(path);
                     if (!path.endsWith(".class")) throw new IOException("Expected a class entry");
-                    byte[] data = read(jar, path);
-                    if (data == null) {
-                        for (ZipFile library : libraries.jars) {
-                            data = read(library, path);
-                            if (data != null) break;
-                        }
-                    }
+                    byte[] data = readClass(jar, path);
+                    if (data == null) data = libraries.find(path);
                     if (data == null) {
                         try (var standard = ClassLoader.getPlatformClassLoader().getResourceAsStream(path)) {
                             if (standard != null) data = standard.readAllBytes();
@@ -160,41 +154,11 @@ public final class DecompilerWorker {
         }
     }
 
-    private static byte[] read(ZipFile jar, String name) throws IOException {
+    static byte[] readClass(ZipFile jar, String name) throws IOException {
         var entry = jar.getEntry(name);
         if (entry == null) return null;
         try (var stream = jar.getInputStream(entry)) {
             return stream.readAllBytes();
-        }
-    }
-
-    private static boolean compile(Path input, Path output, String release, List<Path> dependencies,
-                                   List<String> messages) throws IOException {
-        var compiler = ToolProvider.getSystemJavaCompiler();
-        if (compiler == null) {
-            message(messages, "javac", "A full JDK is required");
-            return false;
-        }
-        List<Path> paths;
-        try (var stream = Files.walk(input)) {
-            paths = stream.filter(path -> path.toString().endsWith(".java") && Files.isRegularFile(path))
-                    .sorted().toList();
-        }
-        if (paths.isEmpty()) {
-            message(messages, "javac", "No Java source files");
-            return false;
-        }
-        var empty = Files.createDirectory(output.resolve("empty"));
-        var options = List.of("-proc:none", "-implicit:none", "--release", release, "-encoding", "UTF-8",
-                "--source-path", empty.toString(), "--class-path", dependencies.isEmpty() ? empty.toString()
-                : String.join(java.io.File.pathSeparator, dependencies.stream().map(Path::toString).toList()),
-                "-d", output.toString());
-        try (var manager = compiler.getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8)) {
-            return compiler.getTask(null, manager, diagnostic -> {
-                JavaFileObject unit = diagnostic.getSource();
-                String location = unit == null ? "" : Path.of(unit.toUri()).getFileName() + ":" + diagnostic.getLineNumber();
-                message(messages, diagnostic.getKind() + " " + location, diagnostic.getMessage(Locale.ROOT));
-            }, options, null, manager.getJavaFileObjectsFromPaths(paths)).call();
         }
     }
 
@@ -204,7 +168,7 @@ public final class DecompilerWorker {
         }
     }
 
-    private static final class Libraries implements AutoCloseable {
+    static final class Libraries implements AutoCloseable {
         final List<ZipFile> jars = new ArrayList<>();
 
         Libraries(List<Path> paths) throws IOException {
@@ -218,6 +182,14 @@ public final class DecompilerWorker {
                 }
                 throw failure;
             }
+        }
+
+        byte[] find(String name) throws IOException {
+            for (ZipFile jar : jars) {
+                byte[] data = readClass(jar, name);
+                if (data != null) return data;
+            }
+            return null;
         }
 
         @Override

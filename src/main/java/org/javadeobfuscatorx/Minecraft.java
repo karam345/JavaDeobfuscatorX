@@ -17,17 +17,26 @@ final class Minecraft {
     final List<String> metadata = new ArrayList<>();
     final Set<String> signals = new TreeSet<>();
     private final Set<String> entrypoints = new TreeSet<>();
+    private final Set<String> modEntrypoints = new TreeSet<>();
 
     Minecraft(Archive archive) throws IOException {
-        for (String file : List.of("plugin.yml", "paper-plugin.yml", "bungee.yml", "velocity-plugin.json")) {
+        for (String file : List.of("plugin.yml", "paper-plugin.yml", "bungee.yml", "velocity-plugin.json",
+                "fabric.mod.json", "META-INF/mods.toml", "META-INF/neoforge.mods.toml")) {
             var entry = archive.resources.get(file);
             if (entry == null) continue;
             metadata.add(Inspection.row(file, "descriptor", switch (file) {
                 case "plugin.yml" -> "Bukkit/Spigot/Paper/Purpur/Folia descriptor";
                 case "paper-plugin.yml" -> "Paper plugin descriptor";
                 case "bungee.yml" -> "BungeeCord descriptor";
+                case "fabric.mod.json" -> "Fabric mod descriptor";
+                case "META-INF/mods.toml" -> "Forge-family mod descriptor";
+                case "META-INF/neoforge.mods.toml" -> "NeoForge mod descriptor";
                 default -> "Velocity descriptor";
             }));
+            if (file.endsWith(".toml")) {
+                signals.add(file.contains("neoforge") ? "NeoForge mod metadata" : "Forge-family mod metadata");
+                continue;
+            }
             if (entry.getSize() > 128 * 1024) {
                 metadata.add(Inspection.row(file, "warning", "Descriptor exceeds parsing budget"));
                 continue;
@@ -39,7 +48,7 @@ final class Minecraft {
                 if (data instanceof Map<?, ?> map) {
                     for (String key : List.of("name", "id", "version", "api-version", "folia-supported", "main",
                             "bootstrapper", "loader", "commands", "permissions", "dependencies", "depend",
-                            "softdepend", "loadbefore", "libraries")) {
+                            "softdepend", "loadbefore", "libraries", "depends", "mixins", "accessWidener", "jars")) {
                         Object value = map.get(key);
                         if (value == null) continue;
                         if (value instanceof String name && Set.of("main", "bootstrapper", "loader").contains(key)) {
@@ -47,11 +56,27 @@ final class Minecraft {
                         }
                         metadata.add(Inspection.row(file, key, summarize(value)));
                     }
+                    if (file.equals("fabric.mod.json")) fabric(map);
                 } else {
                     metadata.add(Inspection.row(file, "warning", "Expected a descriptor mapping"));
                 }
             } catch (RuntimeException | StackOverflowError invalid) {
                 metadata.add(Inspection.row(file, "warning", invalid.getClass().getSimpleName()));
+            }
+        }
+    }
+
+    private void fabric(Map<?, ?> map) {
+        signals.add("Fabric mod metadata");
+        if (!(map.get("entrypoints") instanceof Map<?, ?> groups)) return;
+        for (var group : groups.entrySet().stream().limit(40).toList()) {
+            if (!(group.getKey() instanceof String id) || !(group.getValue() instanceof List<?> entries)) continue;
+            for (Object entry : entries.stream().limit(40).toList()) {
+                Object value = entry instanceof Map<?, ?> options ? options.get("value") : entry;
+                if (!(value instanceof String name) || name.length() > 1024) continue;
+                metadata.add(Inspection.row("fabric.mod.json", "entrypoint " + id, name));
+                String declaringClass = name.split("::", 2)[0];
+                if (javax.lang.model.SourceVersion.isName(declaringClass)) modEntrypoints.add(declaringClass.replace('.', '/'));
             }
         }
     }
@@ -76,6 +101,8 @@ final class Minecraft {
     }
 
     String role(ClassNode node) {
+        if (modEntrypoints.contains(node.name) || node.interfaces.stream().anyMatch(i -> i.startsWith("net/fabricmc/api/")
+                && i.endsWith("ModInitializer"))) return "Mod";
         if (entrypoints.contains(node.name) || "org/bukkit/plugin/java/JavaPlugin".equals(node.superName)
                 || "net/md_5/bungee/api/plugin/Plugin".equals(node.superName)
                 || node.visibleAnnotations != null && node.visibleAnnotations.stream().anyMatch(
@@ -89,8 +116,19 @@ final class Minecraft {
     }
 
     void inspectClass(ClassNode node) {
+        if (node.visibleAnnotations != null) {
+            for (var annotation : node.visibleAnnotations) {
+                if (annotation.desc.equals("Lnet/minecraftforge/fml/common/Mod;")) {
+                    modEntrypoints.add(node.name);
+                    signals.add("Forge @Mod annotation");
+                } else if (annotation.desc.equals("Lnet/neoforged/fml/common/Mod;")) {
+                    modEntrypoints.add(node.name);
+                    signals.add("NeoForge @Mod annotation");
+                }
+            }
+        }
         String role = role(node);
-        if (Set.of("Plugin", "Listener", "Command").contains(role)) {
+        if (Set.of("Plugin", "Listener", "Command", "Mod").contains(role)) {
             signals.add(role + " API class");
         }
         if (node.visibleAnnotations != null && node.visibleAnnotations.stream().anyMatch(
@@ -132,6 +170,9 @@ final class Minecraft {
     void finish(Set<String> classes) {
         for (String entrypoint : entrypoints) {
             metadata.add(Inspection.row("entrypoint", entrypoint, classes.contains(entrypoint) ? "present" : "missing in selected view"));
+        }
+        for (String entrypoint : modEntrypoints) {
+            metadata.add(Inspection.row("mod entrypoint", entrypoint, classes.contains(entrypoint) ? "present" : "missing in selected view"));
         }
         for (String name : classes) {
             if (name.startsWith("com/github/retrooper/packetevents/") || name.contains("/com/github/retrooper/packetevents/")) {

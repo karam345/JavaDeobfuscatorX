@@ -29,7 +29,9 @@ public final class Main {
 
                           --out PATH           New output directory (default: jdx-out/<name>-<mode>)
                           --release N          Select multi-release view (8–25, default 21)
-                          --compile            Compile generated source with javac (release 8–21)
+                          --source-release N   Override the detected javac source target
+                          --compile            Compile reconstructed Java with javac
+                          --project            Export an offline Gradle project with original resources
                           --sources PATH       Verify explicit Java source directory (verify)
                           --classpath JAR      Local dependency JAR (repeat up to 16 times)
                           --engine NAME        auto, vineflower or cfr (default auto)
@@ -93,11 +95,12 @@ public final class Main {
             try {
                 var libraries = Exports.dependencies(options.classpath, work, options.limits, options.release);
                 if (reconstruct && archive != null) {
-                    partial |= reconstruct(options, archive, rewrite, destination, work, libraries, report, progress);
+                    partial |= Reconstruction.run(options, archive, rewrite, destination, work, libraries, report, progress);
                 } else if (options.sources != null) {
                     progress.println("Staging supplied source files");
                     Path sources = Exports.stageSources(options.sources, work);
-                    partial |= !compile(options, sources, destination, work, libraries, "provided", report, progress);
+                    partial |= !Reconstruction.compile(options, sources, destination, work, libraries,
+                            options.sourceRelease(archive), "provided", report, progress);
                 }
             } finally {
                 Exports.deleteWork(work);
@@ -124,7 +127,7 @@ public final class Main {
         report.add("Obfuscator attribution: " + (inspection.attribution.isEmpty() ? "unknown" : "metadata evidence only"));
         inspection.attribution.forEach(item -> report.add("  " + Inspection.row(item)));
         inspection.findings.forEach((signal, count) -> report.add("  " + signal + ": " + count));
-        report.add("Literal Base64 payloads decoded as UTF-8: " + inspection.strings.size());
+        report.add("Decodable literal string sites: " + inspection.strings.size());
         report.add("Identifier suggestions: " + inspection.names.size());
         if (inspection.evidenceTruncated) report.add("Evidence table limit reached; some rows were omitted");
         report.add("Class issues: " + inspection.problems.size());
@@ -133,81 +136,26 @@ public final class Main {
         Exports.table(destination.resolve("mappings.tsv"), "kind\tclass\tmember\tdescriptor\tsuggestion\tconfidence", inspection.names);
         Exports.table(destination.resolve("references.tsv"), "from_class\tto_class", inspection.references);
         Exports.table(destination.resolve("strings.tsv"), "class\tmethod\tdescriptor\tcodec\ttext", inspection.strings);
+        Exports.table(destination.resolve("bootstraps.tsv"),
+                "class\tmethod\tdescriptor\tkind\tname\tcall_descriptor\tbootstrap_owner\tbootstrap_name"
+                        + "\tbootstrap_descriptor\targument_count\tmethod_handles", inspection.bootstraps);
+        Exports.table(destination.resolve("wrappers.tsv"),
+                "class\tmethod\tdescriptor\tkind\ttarget_owner\ttarget_name\ttarget_descriptor", inspection.wrappers);
         Exports.table(destination.resolve("class-issues.tsv"), "issue",
                 inspection.problems.stream().map(problem -> Inspection.row(problem)).toList());
     }
 
-    private static boolean reconstruct(Options options, Archive archive, boolean rewrite, Path destination,
-                                       Path work, List<Path> libraries, List<String> report, PrintStream progress)
-            throws IOException, InterruptedException {
-        progress.println(rewrite ? "Applying and checking conservative bytecode rewrites" : "Staging a class-only archive");
-        Path stage = (rewrite ? destination : work).resolve("bytecode.jar");
-        var staged = Exports.stage(archive, stage, rewrite);
-        progress.println("Preserving archive resources");
-        Exports.resources(archive, destination.resolve("resources.zip"));
-        staged.changes().forEach((pattern, count) -> report.add("  Applied " + pattern + ": " + count));
-        if (rewrite) report.add("Rewrite skips or rollbacks: " + staged.rollbacks().size());
-        Exports.table(destination.resolve("rewrite-issues.tsv"), "class\treason", staged.rollbacks());
-        if (staged.classes() == 0) {
-            report.add("Decompilation skipped: no parseable classes in the selected view");
-            return true;
-        }
-
-        boolean comparison = options.command.equals("compare");
-        boolean vineflower = comparison || !options.engine.equals("cfr");
-        Path primary = destination.resolve(comparison ? "vineflower" : "sources");
-        var first = decompile(options, vineflower ? "vineflower" : "cfr", stage, primary, destination, libraries, report, progress);
-        boolean failed = first.code() != 0;
-        if (comparison || failed && options.engine.equals("auto")) {
-            Path alternative = destination.resolve("cfr");
-            var second = decompile(options, "cfr", stage, alternative, destination, libraries, report, progress);
-            if (comparison) {
-                Exports.compare(primary, alternative, destination.resolve("comparison.tsv"));
-                failed |= second.code() != 0;
-                if (options.compile) failed |= !compile(options, alternative, destination, work, libraries, "cfr", report, progress);
-            } else if (second.code() == 0) {
-                failed = false;
-                primary = alternative;
-                report.add("CFR fallback completed; primary output retained for review");
-            }
-        }
-        if (options.compile) {
-            failed |= !compile(options, primary, destination, work, libraries, comparison ? "vineflower" : "primary", report, progress);
-        } else {
-            report.add("Source compilation: not requested");
-        }
-        return failed;
-    }
-
-    private static Exports.SourceRun decompile(Options options, String engine, Path input, Path sources, Path destination,
-                                               List<Path> libraries, List<String> report, PrintStream progress)
-            throws IOException, InterruptedException {
-        progress.println("Decompiling with " + engine);
-        var result = Exports.run(engine, input, sources, destination.resolve(engine + "-diagnostics.tsv"), libraries,
-                options.timeout, options.heap, options.release, progress);
-        report.add(engine + ": " + result.files() + " Java source files (" + result.status() + ")");
-        return result;
-    }
-
-    private static boolean compile(Options options, Path input, Path destination, Path work, List<Path> libraries,
-                                   String label, List<String> report, PrintStream progress) throws IOException, InterruptedException {
-        progress.println("Checking source compilation with javac (" + label + ")");
-        var result = Exports.run("compile", input, work.resolve("compiled-" + label),
-                destination.resolve("javac-" + label + ".tsv"), libraries,
-                options.timeout, options.heap, options.release, progress);
-        report.add("javac " + label + ": " + result.status());
-        return result.code() == 0;
-    }
-
-    private static final class Options {
+    static final class Options {
         final String command;
         Path input;
         Path output;
         Path sources;
         final List<Path> classpath = new ArrayList<>();
         boolean compile;
+        boolean project;
         String engine = "auto";
         int release = 21;
+        int sourceRelease;
         int timeout = 180;
         int heap = 512;
         Archive.Limits limits = Archive.Limits.defaults();
@@ -238,6 +186,10 @@ public final class Main {
                     options.compile = true;
                     continue;
                 }
+                if (flag.equals("--project")) {
+                    options.project = true;
+                    continue;
+                }
                 if (++i == args.length || args[i].startsWith("--")) throw new IllegalArgumentException("Missing value for " + flag);
                 String value = args[i];
                 switch (flag) {
@@ -246,6 +198,7 @@ public final class Main {
                     case "--classpath" -> options.classpath.add(absolute(value));
                     case "--engine" -> options.engine = value;
                     case "--release" -> options.release = integer(flag, value, 8, 25);
+                    case "--source-release" -> options.sourceRelease = integer(flag, value, 8, 27);
                     case "--timeout" -> options.timeout = integer(flag, value, 1, 1800);
                     case "--worker-heap" -> options.heap = integer(flag, value, 128, 2048);
                     case "--max-entries" -> entries = integer(flag, value, 1, 100_000);
@@ -258,12 +211,12 @@ public final class Main {
             if (options.input == null && options.sources == null) throw new IllegalArgumentException("Specify an input archive or verify --sources.");
             boolean generatesSources = Set.of("decompile", "deobfuscate", "compare").contains(command);
             if (options.sources != null && !command.equals("verify")
-                    || options.compile && !generatesSources
+                    || (options.compile || options.project) && !generatesSources
                     || !options.classpath.isEmpty() && !(generatesSources || options.sources != null)
                     || options.classpath.size() > 16
                     || seen.contains("--engine") && !Set.of("decompile", "deobfuscate").contains(command)
                     || !Set.of("auto", "vineflower", "cfr").contains(options.engine)
-                    || (options.sources != null || options.compile) && options.release > 21) {
+                    || options.sourceRelease != 0 && !(generatesSources || options.sources != null)) {
                 throw new IllegalArgumentException("Options are incompatible with this command or exceed its limits. Run jdx help.");
             }
             options.limits = new Archive.Limits(entries, entryMiB * Archive.MIB,
@@ -276,6 +229,13 @@ public final class Main {
             }
             if (options.output.getParent() == null) throw new IllegalArgumentException("Output must be a new directory.");
             return options;
+        }
+
+        int sourceRelease(Archive archive) {
+            if (sourceRelease != 0) return sourceRelease;
+            if (archive == null || archive.selected.isEmpty()) return release;
+            return archive.selected.values().stream().mapToInt(entry -> Math.max(8, entry.major() - 44)).max()
+                    .orElse(release);
         }
 
         private static int integer(String flag, String value, int min, int max) {

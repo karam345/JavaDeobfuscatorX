@@ -1,5 +1,7 @@
 package org.javadeobfuscatorx;
 
+import org.objectweb.asm.ConstantDynamic;
+import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
@@ -12,13 +14,10 @@ import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TableSwitchInsnNode;
 import org.objectweb.asm.tree.TypeInsnNode;
+import org.objectweb.asm.tree.VarInsnNode;
 
-import javax.lang.model.SourceVersion;
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -41,6 +40,8 @@ final class Inspection implements Opcodes {
     final List<String> references = new ArrayList<>();
     final List<String> names = new ArrayList<>();
     final List<String> strings = new ArrayList<>();
+    final List<String> bootstraps = new ArrayList<>();
+    final List<String> wrappers = new ArrayList<>();
     final Minecraft minecraft;
     int parsed;
     int verified;
@@ -63,7 +64,7 @@ final class Inspection implements Opcodes {
                 inspectClass(node);
                 parsed++;
                 if (verify) {
-                    Bytecode.verify(bytes);
+                    Bytecode.verify(node);
                     verified++;
                 }
             } catch (org.objectweb.asm.tree.analysis.AnalyzerException | RuntimeException | StackOverflowError failure) {
@@ -143,6 +144,7 @@ final class Inspection implements Opcodes {
             if (insn instanceof MethodInsnNode call) {
                 calls++;
                 reference.accept(call.owner);
+                reference(Type.getMethodType(call.desc), reference);
                 minecraft.inspectCall(call);
                 if (call.owner.startsWith("java/lang/reflect/") || call.owner.equals("java/lang/invoke/MethodHandles$Lookup")
                         || call.owner.equals("java/lang/Class") && call.name.equals("forName")) count("reflection or method-handle call");
@@ -157,7 +159,9 @@ final class Inspection implements Opcodes {
                 else reference.accept(type.desc);
             } else if (insn instanceof InvokeDynamicInsnNode dynamic) {
                 count("invokedynamic");
-                reference.accept(dynamic.bsm.getOwner());
+                reference(Type.getMethodType(dynamic.desc), reference);
+                bootstrap(node, method, "invokedynamic", dynamic.name, dynamic.desc, dynamic.bsm,
+                        dynamic.bsmArgs, dynamic.bsmArgs.length, reference);
                 if (!Set.of("java/lang/invoke/StringConcatFactory", "java/lang/invoke/LambdaMetafactory",
                         "java/lang/runtime/ObjectMethods", "java/lang/runtime/SwitchBootstraps")
                         .contains(dynamic.bsm.getOwner())) count("custom invokedynamic bootstrap");
@@ -166,13 +170,28 @@ final class Inspection implements Opcodes {
                 count("switch");
             } else if (insn instanceof org.objectweb.asm.tree.JumpInsnNode jump && seen.contains(jump.label)) {
                 backwardEdges++;
-            } else if (insn instanceof LdcInsnNode load && load.cst instanceof org.objectweb.asm.ConstantDynamic dynamic) {
+            } else if (insn instanceof LdcInsnNode load && load.cst instanceof ConstantDynamic dynamic) {
                 count("constant dynamic");
-                reference.accept(dynamic.getBootstrapMethod().getOwner());
+                int count = dynamic.getBootstrapMethodArgumentCount();
+                Object[] arguments = new Object[Math.min(count, 32)];
+                for (int i = 0; i < arguments.length; i++) arguments[i] = dynamic.getBootstrapMethodArgument(i);
+                reference(Type.getType(dynamic.getDescriptor()), reference);
+                bootstrap(node, method, "constant dynamic", dynamic.getName(), dynamic.getDescriptor(),
+                        dynamic.getBootstrapMethod(), arguments, count, reference);
+            } else if (insn instanceof LdcInsnNode load) {
+                constantReference(load.cst, reference);
             }
         }
         if (switches > 0 && backwardEdges > 0) count("method with switch and backward edge");
         if (calls == 1 && realInstructions <= 10) count("short single-call method");
+        if ((method.access & ACC_BRIDGE) != 0) count("bridge method");
+        var forwarded = forwarding(method);
+        if (forwarded != null) {
+            count("verified forwarding shape");
+            add(wrappers, row(node.name, method.name, method.desc,
+                    (method.access & ACC_BRIDGE) != 0 ? "bridge" : "wrapper",
+                    forwarded.owner, forwarded.name, forwarded.desc));
+        }
         if (suspicious(method.name) && !method.name.startsWith("<")) {
             count("short or source-incompatible method name");
             boolean getter = accessor != null && calls == 0
@@ -186,21 +205,55 @@ final class Inspection implements Opcodes {
     }
 
     private void decode(ClassNode node, MethodNode method, MethodInsnNode call) {
-        if (!call.owner.equals("java/util/Base64$Decoder") || !call.name.equals("decode")
-                || !call.desc.equals("(Ljava/lang/String;)[B") || call.getOpcode() != INVOKEVIRTUAL
-                || !(call.getPrevious() instanceof LdcInsnNode load) || !(load.cst instanceof String literal)
-                || literal.length() < 4 || literal.length() > 4096
-                || !(load.getPrevious() instanceof MethodInsnNode factory)
-                || !factory.owner.equals("java/util/Base64") || !factory.name.equals("getDecoder")
-                || factory.getOpcode() != INVOKESTATIC || !factory.desc.equals("()Ljava/util/Base64$Decoder;")
-                || strings.size() >= 1000) return;
-        try {
-            String text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(Base64.getDecoder().decode(literal))).toString();
-            if (!text.isBlank() && text.codePoints().noneMatch(c -> Character.isISOControl(c) && c != '\n' && c != '\t')) {
-                add(strings, row(node.name, method.name, method.desc, "Base64 to UTF-8", text));
-            }
-        } catch (IllegalArgumentException | java.nio.charset.CharacterCodingException ignored) {
-            // A malformed literal or binary payload supplies no text evidence.
+        if (strings.size() >= 1000) return;
+        var decoded = Strings.evidence(call);
+        if (decoded != null && !decoded.text().isBlank()
+                && decoded.text().codePoints().noneMatch(c -> Character.isISOControl(c) && c != '\n' && c != '\t')) {
+            add(strings, row(node.name, method.name, method.desc, decoded.codec(), decoded.text()));
+        }
+    }
+
+    private static MethodInsnNode forwarding(MethodNode method) {
+        if (method.name.startsWith("<") || !method.tryCatchBlocks.isEmpty() || method.instructions.size() > 128) return null;
+        var code = java.util.Arrays.stream(method.instructions.toArray()).filter(i -> i.getOpcode() >= 0).toList();
+        if (code.size() < 2) return null;
+        int index = 0;
+        var expected = new ArrayList<Type>();
+        if ((method.access & ACC_STATIC) == 0) expected.add(Type.getType(Object.class));
+        expected.addAll(List.of(Type.getArgumentTypes(method.desc)));
+        int slot = 0;
+        for (Type type : expected) {
+            if (index >= code.size() || !(code.get(index++) instanceof VarInsnNode load)
+                    || load.var != slot || load.getOpcode() != type.getOpcode(ILOAD)) return null;
+            slot += type.getSize();
+            if (type.getSort() >= Type.ARRAY && index < code.size() && code.get(index).getOpcode() == CHECKCAST) index++;
+        }
+        if (index >= code.size() || !(code.get(index++) instanceof MethodInsnNode call) || call.name.startsWith("<")) return null;
+        if (expected.size() != Type.getArgumentTypes(call.desc).length + (call.getOpcode() == INVOKESTATIC ? 0 : 1)) return null;
+        if (index < code.size() && code.get(index).getOpcode() == CHECKCAST) index++;
+        return index == code.size() - 1 && code.get(index).getOpcode() == Type.getReturnType(method.desc).getOpcode(IRETURN)
+                ? call : null;
+    }
+
+    private void bootstrap(ClassNode node, MethodNode method, String kind, String name, String desc, Handle handle,
+                           Object[] arguments, int argumentCount, Consumer<String> target) {
+        constantReference(handle, target);
+        var handles = new ArrayList<String>();
+        for (int i = 0; i < Math.min(32, arguments.length); i++) {
+            Object argument = arguments[i];
+            constantReference(argument, target);
+            if (argument instanceof Handle h) handles.add(h.getOwner() + "." + h.getName() + h.getDesc());
+            if (argument instanceof ConstantDynamic dynamic) constantReference(dynamic.getBootstrapMethod(), target);
+        }
+        add(bootstraps, row(node.name, method.name, method.desc, kind, name, desc, handle.getOwner(),
+                handle.getName(), handle.getDesc(), Integer.toString(argumentCount), String.join(", ", handles)));
+    }
+
+    private static void constantReference(Object value, Consumer<String> target) {
+        if (value instanceof Type type) reference(type, target);
+        if (value instanceof Handle handle) {
+            target.accept(handle.getOwner());
+            reference(Type.getType(handle.getDesc()), target);
         }
     }
 
@@ -209,12 +262,16 @@ final class Inspection implements Opcodes {
     }
 
     private static boolean suspicious(String name) {
-        return name.codePointCount(0, name.length()) <= 2 || !SourceVersion.isIdentifier(name) || SourceVersion.isKeyword(name);
+        return name.codePointCount(0, name.length()) <= 2 || !Identifiers.sourceName(name);
     }
 
     private static void reference(Type type, Consumer<String> target) {
         if (type.getSort() == Type.ARRAY) type = type.getElementType();
         if (type.getSort() == Type.OBJECT) target.accept(type.getInternalName());
+        if (type.getSort() == Type.METHOD) {
+            for (Type argument : type.getArgumentTypes()) reference(argument, target);
+            reference(type.getReturnType(), target);
+        }
     }
 
     private void count(String finding) {
