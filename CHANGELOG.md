@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Pin the JUnit BOM POM checksum so clean Gradle caches can verify test dependencies.
+
 ## 0.1.0
 
 - Added one Codex skill and a Java 21 CLI for local JAR analysis and reconstruction.
