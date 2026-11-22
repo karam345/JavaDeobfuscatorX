@@ -32,6 +32,7 @@ final class Rewrites implements Opcodes {
             if (insn.getOpcode() == JSR || insn.getOpcode() == RET) return counts;
         }
         Bytecode.checkBudget(method);
+        if (strings != null) strings.startMethod(method);
         Frame<ConstantFlow.Fact>[] frames = new Analyzer<>(new ConstantFlow(strings)).analyze(owner, method);
 
         // Apply facts against the original graph. Only remove adjacent producers if they are still literal.
@@ -50,7 +51,7 @@ final class Rewrites implements Opcodes {
             }
         }
         if (strings != null) return counts;
-        int handlers = removeShadowedHandlers(method);
+        int handlers = flow ? removeShadowedHandlers(method) : 0;
         if (handlers != 0) counts.put("shadowed exception handler", handlers);
         if (flow) normalize(owner, method, counts, reachabilityChanged || handlers != 0);
         int names = Identifiers.normalizeLocals(method);
@@ -107,12 +108,14 @@ final class Rewrites implements Opcodes {
 
         if (!flow) return null;
         if (insn instanceof JumpInsnNode jump) {
+            boolean sameTarget = opcode != GOTO && executable(jump.getNext()) == executable(jump.label);
             Boolean taken = branch(opcode, left, right);
-            if (taken != null) {
-                var replacement = taken ? new JumpInsnNode(GOTO, jump.label) : new InsnNode(NOP);
+            if (taken != null || sameTarget) {
+                var replacement = Boolean.TRUE.equals(taken) && !sameTarget
+                        ? new JumpInsnNode(GOTO, jump.label) : new InsnNode(NOP);
                 if (opcode >= IF_ICMPEQ && opcode <= IF_ACMPNE) replace(code, insn, replacement, right, left);
                 else replace(code, insn, replacement, right);
-                return "constant branch";
+                return sameTarget ? "redundant branch" : "constant branch";
             }
         }
         LabelNode target = switchTarget(insn, right.number() instanceof Integer key ? key : null);
@@ -181,10 +184,12 @@ final class Rewrites implements Opcodes {
         if (opcode >= IFEQ && opcode <= IFLE && right.number() instanceof Integer value) {
             return matches(Integer.compare(value, 0), opcode - IFEQ);
         }
+        if ((opcode == IFEQ || opcode == IFNE) && right.nonzero()) return opcode == IFNE;
         if (opcode >= IF_ICMPEQ && opcode <= IF_ICMPLE && left != null
                 && left.number() instanceof Integer a && right.number() instanceof Integer b) {
             return matches(Integer.compare(a, b), opcode - IF_ICMPEQ);
         }
+        if ((opcode == IF_ICMPEQ || opcode == IF_ICMPNE) && left != null && left.differs(right)) return opcode == IF_ICMPNE;
         if ((opcode == IFNULL || opcode == IFNONNULL) && right.isNull()) return opcode == IFNULL;
         if ((opcode == IF_ACMPEQ || opcode == IF_ACMPNE) && left != null && left.isNull() && right.isNull()) {
             return opcode == IF_ACMPEQ;

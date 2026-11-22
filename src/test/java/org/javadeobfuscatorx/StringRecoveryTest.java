@@ -163,7 +163,7 @@ class StringRecoveryTest implements Opcodes {
     }
 
     @Test
-    void reportsRolledBackStringSitesWithoutCountingReplacements() throws Exception {
+    void keepsOversizedMethodsAndReportsTheSkippedStringReplacement() throws Exception {
         var writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         writer.visit(V1_8, ACC_PUBLIC, "Sample", null, "java/lang/Object", null);
         var method = writer.visitMethod(ACC_PUBLIC | ACC_STATIC, "value", "()Ljava/lang/String;", null, null);
@@ -183,9 +183,9 @@ class StringRecoveryTest implements Opcodes {
         byte[] input = writer.toByteArray();
         var result = rewrite(input);
         assertArrayEquals(input, result.bytes());
-        assertTrue(result.rollback().contains("MethodTooLarge"), result.rollback());
-        assertEquals(new StringRecovery.Counts(1, 1, 0, 0, 1), result.strings());
-        assertTrue(result.stringSites().getFirst().contains("rolled back"));
+        assertNull(result.rollback(), result.rollback());
+        assertEquals(new StringRecovery.Counts(1, 1, 0, 1, 0), result.strings());
+        assertTrue(result.stringSites().getFirst().contains("Replacement may exceed JVM method code size"));
     }
 
     @Test

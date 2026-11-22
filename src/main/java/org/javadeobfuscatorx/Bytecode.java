@@ -19,16 +19,22 @@ import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
 import java.util.TreeMap;
+import java.util.HashSet;
+import java.util.Set;
 
 final class Bytecode {
     private static final int PASSES = 6;
     record Result(byte[] bytes, Map<String, Integer> changes, String rollback,
                   StringRecovery.Counts strings, List<String> stringSites) {}
     private record MethodKey(String name, String descriptor) {}
-    private record Pass(Map<MethodKey, MethodNode> replacements, Map<String, Integer> counts) {
-        boolean changedControlFlow() {
-            return counts.keySet().stream().anyMatch(change -> change.contains("jump") || change.contains("branch")
-                    || change.contains("switch") || change.contains("handler") || change.equals("unreachable instruction"));
+    private record Replacement(MethodNode method, boolean computeFrames) {}
+    private record Pass(Map<MethodKey, Replacement> replacements, Map<String, Integer> counts) {}
+    private static final class FrameFailure extends RuntimeException {
+        final MethodKey method;
+
+        FrameFailure(MethodKey method, IllegalArgumentException cause) {
+            super(cause);
+            this.method = method;
         }
     }
 
@@ -93,11 +99,16 @@ final class Bytecode {
     }
 
     static Result transform(byte[] original, ClassNode node, Hierarchy hierarchy) {
+        return transform(original, node, hierarchy, null);
+    }
+
+    static Result transform(byte[] original, ClassNode node, Hierarchy hierarchy, DecoderIndex decoders) {
         var changes = new TreeMap<String, Integer>();
         byte[] verified = original;
         String owner = node.name;
         StringRecovery strings = null;
         boolean stringsCommitted = false;
+        var frameSkips = new java.util.ArrayList<String>();
         try {
             // Keep custom attributes and legacy subroutines byte-for-byte.
             if (node.attrs != null || node.fields.stream().anyMatch(field -> field.attrs != null)
@@ -106,10 +117,26 @@ final class Bytecode {
             }
             verify(node);
             boolean flow = (node.version & 0xffff) >= 51;
+            var preserveFrames = new HashSet<MethodKey>();
             for (int pass = 0; pass < PASSES; pass++) {
-                var numeric = rewrite(node, flow, null);
+                var numeric = rewrite(node, flow, null, preserveFrames);
                 if (numeric.replacements.isEmpty()) break;
-                byte[] candidate = write(verified, numeric.replacements, hierarchy, flow && numeric.changedControlFlow());
+                byte[] candidate;
+                while (true) {
+                    if (numeric.replacements.isEmpty()) {
+                        candidate = verified;
+                        break;
+                    }
+                    try {
+                        candidate = write(verified, numeric.replacements, hierarchy);
+                        break;
+                    } catch (FrameFailure failure) {
+                        frameSkips.add(failure.method.name + failure.method.descriptor + ": " + Inspection.failure(failure.getCause()));
+                        if (!preserveFrames.add(failure.method) || preserveFrames.size() >= 16) flow = false;
+                        numeric = rewrite(parse(verified), flow, null, preserveFrames);
+                    }
+                }
+                if (candidate == verified) break;
                 node = parse(candidate);
                 verify(node);
                 verified = candidate;
@@ -117,16 +144,18 @@ final class Bytecode {
             }
 
             // A branch removed by a verified pass can expose constant inputs at a later join.
-            strings = new StringRecovery(node);
-            var stringPass = rewrite(node, false, strings);
+            node = parse(verified);
+            strings = new StringRecovery(node, decoders);
+            var stringPass = rewrite(node, false, strings, Set.of());
             if (!stringPass.replacements.isEmpty()) {
-                byte[] candidate = write(verified, stringPass.replacements, hierarchy, false);
+                byte[] candidate = write(verified, stringPass.replacements, hierarchy);
                 verify(candidate);
                 verified = candidate;
                 stringsCommitted = true;
                 stringPass.counts.forEach((key, value) -> changes.merge(key, value, Integer::sum));
             }
-            return new Result(verified, changes, null, strings.counts(stringsCommitted), strings.rows(owner, stringsCommitted));
+            return new Result(verified, changes, frameSkips.isEmpty() ? null : String.join(" | ", frameSkips),
+                    strings.counts(stringsCommitted), strings.rows(owner, stringsCommitted));
         } catch (AnalyzerException | RuntimeException | StackOverflowError failure) {
             return new Result(verified, changes, Inspection.failure(failure),
                     strings == null ? StringRecovery.Counts.EMPTY : strings.counts(stringsCommitted),
@@ -134,23 +163,28 @@ final class Bytecode {
         }
     }
 
-    private static Pass rewrite(ClassNode node, boolean flow, StringRecovery strings) throws AnalyzerException {
-        var replacements = new HashMap<MethodKey, MethodNode>();
+    private static Pass rewrite(ClassNode node, boolean flow, StringRecovery strings, Set<MethodKey> preserveFrames)
+            throws AnalyzerException {
+        var replacements = new HashMap<MethodKey, Replacement>();
         var counts = new TreeMap<String, Integer>();
         for (MethodNode method : node.methods) {
-            var applied = Rewrites.apply(node.name, method, flow, strings);
+            var key = new MethodKey(method.name, method.desc);
+            boolean methodFlow = flow && !preserveFrames.contains(key);
+            var applied = Rewrites.apply(node.name, method, methodFlow, strings);
             if (!applied.isEmpty()) {
-                replacements.put(new MethodKey(method.name, method.desc), method);
-                applied.forEach((key, value) -> counts.merge(key, value, Integer::sum));
+                boolean changedEdges = applied.keySet().stream().anyMatch(change -> change.contains("jump")
+                        || change.contains("branch") || change.contains("switch") || change.contains("handler")
+                        || change.equals("unreachable instruction"));
+                replacements.put(key, new Replacement(method, methodFlow && changedEdges));
+                applied.forEach((change, value) -> counts.merge(change, value, Integer::sum));
             }
         }
         return new Pass(replacements, counts);
     }
 
-    private static byte[] write(byte[] input, Map<MethodKey, MethodNode> replacements, Hierarchy hierarchy,
-                                boolean computeFrames) {
+    private static byte[] write(byte[] input, Map<MethodKey, Replacement> replacements, Hierarchy hierarchy) {
         var reader = new ClassReader(input);
-        var writer = new ClassWriter(reader, computeFrames ? ClassWriter.COMPUTE_FRAMES : ClassWriter.COMPUTE_MAXS) {
+        var writer = new ClassWriter(reader, 0) {
             @Override
             protected String getCommonSuperClass(String left, String right) {
                 return hierarchy.common(left, right);
@@ -159,10 +193,17 @@ final class Bytecode {
         reader.accept(new ClassVisitor(Opcodes.ASM9, writer) {
             @Override
             public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
+                var key = new MethodKey(name, descriptor);
+                var replacement = replacements.get(key);
+                writer.setFlags(replacement == null ? 0 : replacement.computeFrames ? ClassWriter.COMPUTE_FRAMES : ClassWriter.COMPUTE_MAXS);
                 MethodVisitor output = super.visitMethod(access, name, descriptor, signature, exceptions);
-                MethodNode replacement = replacements.get(new MethodKey(name, descriptor));
                 if (replacement == null) return output;
-                replacement.accept(output);
+                try {
+                    replacement.method.accept(output);
+                } catch (IllegalArgumentException failure) {
+                    if (!replacement.computeFrames) throw failure;
+                    throw new FrameFailure(key, failure);
+                }
                 return null;
             }
         }, 0);

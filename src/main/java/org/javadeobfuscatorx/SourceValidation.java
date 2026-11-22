@@ -51,14 +51,18 @@ final class SourceValidation {
         if (parseOnly && Math.min(release, runtime) == runtime) options.add("--enable-preview");
         var diagnosticSites = new TreeSet<String>();
         var dependencyHints = new TreeSet<String>();
+        var invalidPaths = new TreeSet<String>();
+        int[] errors = {0};
         try (var manager = compiler.getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8)) {
             var task = (JavacTask) compiler.getTask(null, manager, diagnostic -> {
                 if (diagnostic.getKind() != Diagnostic.Kind.ERROR) return;
+                errors[0]++;
                 JavaFileObject unit = diagnostic.getSource();
                 String path = unit == null ? "" : relative(input, unit);
                 String code = diagnostic.getCode();
                 String message = diagnostic.getMessage(Locale.ROOT);
                 String category = parseOnly ? "syntax" : classify(code, message);
+                if (parseOnly) invalidPaths.add(path);
                 String site = Inspection.row(category, path, code, Long.toString(diagnostic.getLineNumber()), message);
                 if (diagnosticSites.size() < 4000 && diagnosticSites.add(site)) {
                     messages.add(site);
@@ -70,10 +74,16 @@ final class SourceValidation {
                     }
                 }
             }, options, null, manager.getJavaFileObjectsFromPaths(paths));
-            if (!parseOnly) return task.call();
+            if (!parseOnly) {
+                boolean compiled = task.call();
+                if (errors[0] >= 2000) messages.add(Inspection.row("environment", "", "diagnostic-limit",
+                        "", "javac reached the 2000 error limit"));
+                return compiled;
+            }
             int characters = 0;
             for (CompilationUnitTree unit : task.parse()) {
                 String path = relative(input, unit.getSourceFile());
+                messages.add(Inspection.row("parsed", path, ""));
                 String prefix = unit.getPackageName() == null ? "" : unit.getPackageName() + ".";
                 var names = new TreeSet<String>();
                 if (unit.getModule() != null) names.add("module-info");
@@ -89,7 +99,9 @@ final class SourceValidation {
                     messages.add(row);
                 }
             }
-            return diagnosticSites.isEmpty();
+            for (String path : invalidPaths) messages.add(Inspection.row("invalid-syntax", path, ""));
+            messages.add(Inspection.row("parse-complete", "", ""));
+            return invalidPaths.isEmpty();
         }
     }
 

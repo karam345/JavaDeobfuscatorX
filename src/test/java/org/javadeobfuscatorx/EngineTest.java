@@ -70,7 +70,7 @@ class EngineTest implements Opcodes {
     }
 
     @Test
-    void rollbackWhenRecomputedFramesNeedMissingClassHierarchy() throws Exception {
+    void retainsIndependentRewritesWhenFramesNeedMissingClassHierarchy() throws Exception {
         var writer = new ClassWriter(0);
         writer.visit(V21, ACC_PUBLIC, "Merge", null, "java/lang/Object", null);
         var method = writer.visitMethod(ACC_PUBLIC | ACC_STATIC, "value", "(Z)[Ljava/lang/Object;", null, null);
@@ -98,12 +98,23 @@ class EngineTest implements Opcodes {
         method.visitInsn(ARETURN);
         method.visitMaxs(1, 1);
         method.visitEnd();
+        var independent = writer.visitMethod(ACC_PUBLIC | ACC_STATIC, "independent", "()I", null, null);
+        independent.visitCode();
+        independent.visitInsn(ICONST_4);
+        independent.visitInsn(ICONST_2);
+        independent.visitInsn(ISHL);
+        independent.visitInsn(IRETURN);
+        independent.visitMaxs(2, 0);
+        independent.visitEnd();
         writer.visitEnd();
         byte[] original = writer.toByteArray();
         try (var archive = Archive.open(Fixtures.jar(temp.resolve("merge.jar"), Map.of("Merge.class", original)),
                 Archive.Limits.defaults(), 21)) {
             var result = Bytecode.transform(original, new Hierarchy(archive));
-            assertSame(original, result.bytes());
+            assertFalse(java.util.Arrays.equals(original, result.bytes()));
+            assertEquals(1, result.changes().get("integer arithmetic"));
+            assertFalse(result.changes().containsKey("constant branch"));
+            Bytecode.verify(result.bytes());
             assertTrue(result.rollback().contains("Missing hierarchy"), result.rollback());
             var dependency = Fixtures.jar(temp.resolve("hierarchy.jar"), Map.of(
                     "missing/Left.class", Fixtures.marker("missing/Left", 1),

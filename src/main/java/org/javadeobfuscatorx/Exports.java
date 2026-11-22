@@ -44,6 +44,7 @@ final class Exports {
              var libraries = new DecompilerWorker.Libraries(dependencies)) {
             if (library) writeModuleIdentity(zip, archive);
             var hierarchy = new Hierarchy(archive, libraries);
+            var decoders = rewrite ? new DecoderIndex(archive) : null;
             for (var entry : archive.selected.values()) {
                 byte[] data = archive.read(entry.entry());
                 org.objectweb.asm.tree.ClassNode node;
@@ -54,7 +55,7 @@ final class Exports {
                     continue;
                 }
                 if (rewrite) {
-                    var result = Bytecode.transform(data, node, hierarchy);
+                    var result = Bytecode.transform(data, node, hierarchy, decoders);
                     data = result.bytes();
                     if (result.rollback() != null) rollbacks.add(Inspection.row(entry.name(), result.rollback()));
                     result.changes().forEach((key, count) -> changes.merge(key, count, Integer::sum));
@@ -101,7 +102,7 @@ final class Exports {
         return true;
     }
 
-    private static void put(ZipOutputStream zip, String name, byte[] data) throws IOException {
+    static void put(ZipOutputStream zip, String name, byte[] data) throws IOException {
         var entry = new ZipEntry(name);
         entry.setTimeLocal(java.time.LocalDateTime.of(2000, 1, 1, 0, 0));
         zip.putNextEntry(entry);

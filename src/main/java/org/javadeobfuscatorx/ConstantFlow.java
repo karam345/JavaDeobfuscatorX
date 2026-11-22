@@ -14,6 +14,23 @@ import org.objectweb.asm.tree.analysis.Value;
 import java.util.List;
 
 final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcodes {
+    private record Bits(int ones, int zeros) {
+        private static final Bits UNKNOWN = new Bits(0, 0);
+
+        static Bits of(Object value) {
+            return switch (value) {
+                case Integer number -> new Bits(number, ~number);
+                case Bits bits -> bits;
+                case null, default -> UNKNOWN;
+            };
+        }
+
+        Object value() {
+            if ((ones | zeros) == -1) return ones;
+            return equals(UNKNOWN) ? null : this;
+        }
+    }
+
     record Fact(BasicValue type, Object constant) implements Value {
         @Override
         public int getSize() {
@@ -26,6 +43,16 @@ final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcod
 
         Number number() {
             return constant instanceof Number value ? value : null;
+        }
+
+        boolean differs(Fact other) {
+            Bits a = Bits.of(constant);
+            Bits b = Bits.of(other.constant);
+            return ((a.ones & b.zeros) | (a.zeros & b.ones)) != 0;
+        }
+
+        boolean nonzero() {
+            return Bits.of(constant).ones != 0;
         }
     }
 
@@ -67,8 +94,19 @@ final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcod
 
     @Override
     public Fact binaryOperation(AbstractInsnNode insn, Fact left, Fact right) throws AnalyzerException {
-        return fact(basic.binaryOperation(insn, left.type(), right.type()), binary(insn.getOpcode(),
-                left.number(), right.number()));
+        int opcode = insn.getOpcode();
+        Object value = binary(opcode, left.number(), right.number());
+        if (value == null && (opcode == IAND || opcode == IOR || opcode == IXOR)) {
+            Bits a = Bits.of(left.constant);
+            Bits b = Bits.of(right.constant);
+            value = switch (opcode) {
+                case IAND -> new Bits(a.ones & b.ones, a.zeros | b.zeros).value();
+                case IOR -> new Bits(a.ones | b.ones, a.zeros & b.zeros).value();
+                default -> new Bits((a.ones & b.zeros) | (a.zeros & b.ones),
+                        (a.ones & b.ones) | (a.zeros & b.zeros)).value();
+            };
+        }
+        return fact(basic.binaryOperation(insn, left.type(), right.type()), value);
     }
 
     @Override
@@ -92,7 +130,13 @@ final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcod
     public Fact merge(Fact left, Fact right) {
         if (left.equals(right)) return left;
         // BasicValue equality ignores constants. Equal JVM types with different values must lose the fact.
-        return fact(basic.merge(left.type(), right.type()), null);
+        BasicValue type = basic.merge(left.type(), right.type());
+        if (type.equals(BasicValue.INT_VALUE)) {
+            Bits a = Bits.of(left.constant);
+            Bits b = Bits.of(right.constant);
+            return fact(type, new Bits(a.ones & b.ones, a.zeros & b.zeros).value());
+        }
+        return fact(type, null);
     }
 
     private static Fact fact(BasicValue type, Object value) {

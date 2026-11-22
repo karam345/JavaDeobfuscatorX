@@ -10,8 +10,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipFile;
+
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.commons.ClassRemapper;
+import org.objectweb.asm.commons.Remapper;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -41,6 +47,161 @@ class CliTest {
         }
         assertArrayEquals(original, Files.readAllBytes(jar));
         assertEquals(2, run("deobfuscate", jar.toString(), "--out", output.toString()).code);
+    }
+
+    @Test
+    void repairsJvmOnlyNamesAndRecordMetadataAndEvaluatesCrossClassDecoders() throws Exception {
+        Path original = Files.createDirectory(temp.resolve("original"));
+        Path source = temp.resolve("Fixture.java");
+        Files.writeString(source, """
+                package demo;
+                public class Fixture {
+                    public static int guarded(int input) {
+                        if (((input | 1) & 1) == 0) return -1;
+                        return input + 2;
+                    }
+                    public static String text() {
+                        return Decoder.xor("Idmmn") + Decoder.table(1) + Decoder.base("IQ==");
+                    }
+                    public static String guardedDecoder() { return Stateful.read("kept"); }
+                    public int value() { return 9; }
+                    public long valueLong() { return 10; }
+                    public static long variants() {
+                        var item = new Fixture();
+                        return item.value() + item.valueLong() + Inner.marker();
+                    }
+                    public static class Inner {
+                        public static int marker() { return 2; }
+                    }
+                }
+                class Parent {
+                    public static int field = 41;
+                    private static int a() { return field; }
+                    public static java.util.function.IntSupplier reference() { return Parent::a; }
+                }
+                class Child extends Parent {
+                    public static int inherited() { return Child.field; }
+                }
+                record Pair(int number, String text) {}
+                """);
+        Path decoder = temp.resolve("Decoder.java");
+        Files.writeString(decoder, """
+                package demo;
+                public class Decoder {
+                    public static String xor(String value) {
+                        char[] letters = value.toCharArray();
+                        for (int i = 0; i < letters.length; i++) letters[i] ^= 1;
+                        return new String(letters);
+                    }
+                    public static String table(int index) {
+                        char[] table = {'z', 'X'};
+                        return new String(new char[]{table[index]});
+                    }
+                    public static String base(String input) {
+                        return new String(java.util.Base64.getDecoder().decode(input), java.nio.charset.StandardCharsets.UTF_8);
+                    }
+                }
+                """);
+        Path stateful = temp.resolve("Stateful.java");
+        Files.writeString(stateful, """
+                package demo;
+                public class Stateful {
+                    static int state = 7;
+                    public static String read(String input) { return new String(input); }
+                }
+                """);
+        compileFixtures(original, List.of(source, decoder, stateful));
+        var entries = new TreeMap<String, byte[]>();
+        for (String name : List.of("Fixture", "Fixture$Inner", "Decoder", "Stateful", "Parent", "Child", "Pair")) {
+            var node = Bytecode.parse(Files.readAllBytes(original.resolve("demo/" + name + ".class")));
+            if (name.equals("Pair")) {
+                node.access &= ~Opcodes.ACC_RECORD;
+                node.recordComponents = null;
+            }
+            var writer = new ClassWriter(0);
+            node.accept(new ClassRemapper(writer, new Remapper(Opcodes.ASM9) {
+                @Override public String map(String name) {
+                    return name.equals("demo/Fixture$Inner") ? "demo/Fixture$Fixture" : name;
+                }
+                @Override public String mapMethodName(String owner, String method, String desc) {
+                    return owner.equals("demo/Fixture") && method.equals("valueLong") ? "value" : method;
+                }
+                @Override public String mapFieldName(String owner, String field, String desc) {
+                    if ((owner.equals("demo/Parent") || owner.equals("demo/Child")) && field.equals("field")) return "do";
+                    if (owner.equals("demo/Pair") && field.equals("number")) return "n";
+                    return field;
+                }
+            }));
+            byte[] bytes = writer.toByteArray();
+            entries.put(new org.objectweb.asm.ClassReader(bytes).getClassName() + ".class", bytes);
+        }
+        var jar = Fixtures.jar(temp.resolve("obfuscated.jar"), entries);
+        Path baseline = temp.resolve("baseline");
+        var before = run("decompile", jar.toString(), "--engine", "vineflower", "--out", baseline.toString(), "--compile");
+        assertEquals(3, before.code, before.log);
+        assertTrue(Files.readString(baseline.resolve("syntax-primary.tsv")).contains("syntax\tdemo/Parent.java"));
+
+        Path output = temp.resolve("restored");
+        var after = run("deobfuscate", jar.toString(), "--out", output.toString(), "--compile");
+        assertEquals(0, after.code, () -> after.log + diagnostics(output.resolve("javac-primary.tsv")));
+        assertTrue(after.log.contains("Applied constant branch: 1"), after.log);
+        assertTrue(after.log.contains("Record layouts reconstructed in decompiler input: 1"), after.log);
+        assertTrue(after.log.contains("Record bootstrap calls lowered in decompiler input: 3"), after.log);
+        assertTrue(after.log.contains("Files verified by full-tree compilation: 6"), after.log);
+        String mapping = Files.readString(output.resolve("source-renames.tsv"));
+        assertTrue(mapping.contains("field\tdemo/Parent\tdo\tI\tfield"), mapping);
+        assertTrue(mapping.contains("method\tdemo/Parent\ta\t()I\tmethod"), mapping);
+        assertTrue(mapping.contains("method\tdemo/Fixture\tvalue\t()J\tmethod"), mapping);
+        assertTrue(mapping.contains("class\tdemo/Fixture$Fixture\t\t\tdemo/Fixture$Type"), mapping);
+        String strings = Files.readString(output.resolve("string-rewrites.tsv"));
+        assertTrue(strings.contains("\tHelloX!"), strings);
+        assertTrue(strings.contains("Decoder owner may run class initialization"), strings);
+        Path rewritten = output.resolve("bytecode.jar");
+        try (var zip = new ZipFile(rewritten.toFile())) {
+            byte[] actual = DecompilerWorker.readClass(zip, "demo/Fixture.class");
+            assertFalse(Arrays.equals(entries.get("demo/Fixture.class"), actual));
+            var node = Bytecode.parse(actual);
+            var text = node.methods.stream().filter(method -> method.name.equals("text")).findFirst().orElseThrow();
+            assertTrue(Arrays.stream(text.instructions.toArray()).noneMatch(insn -> insn instanceof org.objectweb.asm.tree.MethodInsnNode call
+                    && call.owner.equals("demo/Decoder")));
+            assertTrue(Bytecode.parse(DecompilerWorker.readClass(zip, "demo/Parent.class")).fields.stream()
+                    .anyMatch(field -> field.name.equals("do")));
+        }
+
+        Path reconstructed = Files.createDirectory(temp.resolve("recompiled"));
+        compileFixtures(reconstructed, Exports.sourceFiles(output.resolve("sources")).values().stream().toList());
+        // Only the synthetic test fixture is loaded. Real archives are inspected statically.
+        for (Path location : List.of(jar, rewritten, reconstructed)) {
+            try (var loader = new java.net.URLClassLoader(new java.net.URL[]{location.toUri().toURL()})) {
+                var fixture = loader.loadClass("demo.Fixture");
+                var guard = fixture.getMethod("guarded", int.class);
+                for (int input : new int[]{0, -1, Integer.MAX_VALUE, Integer.MIN_VALUE}) {
+                    assertEquals(input + 2, guard.invoke(null, input));
+                }
+                assertEquals("HelloX!", fixture.getMethod("text").invoke(null));
+                assertEquals("kept", fixture.getMethod("guardedDecoder").invoke(null));
+                assertEquals(21L, fixture.getMethod("variants").invoke(null));
+                var accessor = loader.loadClass("demo.Child").getMethod("inherited");
+                assertTrue(accessor.trySetAccessible());
+                assertEquals(41, accessor.invoke(null));
+                var reference = loader.loadClass("demo.Parent").getMethod("reference");
+                assertTrue(reference.trySetAccessible());
+                assertEquals(41, ((java.util.function.IntSupplier) reference.invoke(null)).getAsInt());
+                var constructor = loader.loadClass("demo.Pair").getDeclaredConstructor(int.class, String.class);
+                assertTrue(constructor.trySetAccessible());
+                Object pair = constructor.newInstance(3, "ok");
+                assertEquals("Pair[number=3, text=ok]", pair.toString());
+                assertEquals(3 * 31 + "ok".hashCode(), pair.hashCode());
+                assertEquals(pair, constructor.newInstance(3, "ok"));
+                assertNotEquals(pair, constructor.newInstance(4, "ok"));
+            }
+        }
+    }
+
+    private static void compileFixtures(Path output, List<Path> files) {
+        var args = new ArrayList<>(List.of("-proc:none", "--release", "21", "-d", output.toString()));
+        files.forEach(file -> args.add(file.toString()));
+        assertEquals(0, javax.tools.ToolProvider.getSystemJavaCompiler().run(null, null, null, args.toArray(String[]::new)));
     }
 
     @Test

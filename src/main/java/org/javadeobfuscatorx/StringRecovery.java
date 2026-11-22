@@ -2,6 +2,7 @@ package org.javadeobfuscatorx;
 
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.objectweb.asm.commons.CodeSizeEvaluator;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InsnList;
@@ -42,15 +43,20 @@ final class StringRecovery implements Opcodes {
     private static final Outcome UNKNOWN = new Outcome("Operands are not proven constants", false);
     private static final Outcome BUDGET = new Outcome("Class string analysis budget exhausted", false);
     private final Decoder decoder;
+    private final DecoderIndex index;
+    private final String owner;
     private final int version;
     private final Map<AbstractInsnNode, Cached> cache = new IdentityHashMap<>();
     private final List<Site> sites = new ArrayList<>();
     private int detected, decoded, proposed, skipped, failed;
     private int literalBudget = 512;
     private int freshUnits = 8192;
+    private int remainingCodeBytes;
 
-    StringRecovery(ClassNode node) {
+    StringRecovery(ClassNode node, DecoderIndex index) {
         decoder = new Decoder(node);
+        this.index = index;
+        owner = node.name;
         version = node.version & 0xffff;
     }
 
@@ -66,7 +72,11 @@ final class StringRecovery implements Opcodes {
 
     private boolean candidate(AbstractInsnNode insn) {
         if (insn instanceof InvokeDynamicInsnNode indy) return StringConcat.candidate(indy);
-        return insn instanceof MethodInsnNode call && decoder.target(call) != null && Type.getReturnType(call.desc).equals(STRING);
+        if (!(insn instanceof MethodInsnNode call) || call.getOpcode() != INVOKESTATIC || call.itf
+                || !Type.getReturnType(call.desc).equals(STRING)) return false;
+        if (call.owner.equals(owner)) return decoder.entry(call, false) != null;
+        var external = index == null ? null : index.find(call.owner);
+        return external != null && external.decoder().entry(call, true) != null;
     }
 
     boolean hasCandidate(AbstractInsnNode[] instructions) {
@@ -74,6 +84,12 @@ final class StringRecovery implements Opcodes {
             if (candidate(instruction) || Strings.literalSite(instruction) != null) return true;
         }
         return false;
+    }
+
+    void startMethod(MethodNode method) {
+        var size = new CodeSizeEvaluator(null);
+        method.accept(size);
+        remainingCodeBytes = Math.max(0, 65_535 - size.getMaxSize());
     }
 
     String infer(AbstractInsnNode insn, List<? extends ConstantFlow.Fact> values) {
@@ -86,7 +102,7 @@ final class StringRecovery implements Opcodes {
         var args = new ArrayList<>(values.size());
         for (var value : values) {
             Object constant = value.isNull() ? NULL : value.constant();
-            if (constant == null) return UNKNOWN;
+            if (!(constant instanceof String || constant instanceof Number) && constant != NULL) return UNKNOWN;
             args.add(constant);
         }
         Cached previous = cache.get(insn);
@@ -104,8 +120,14 @@ final class StringRecovery implements Opcodes {
                 }
             } else {
                 var call = (MethodInsnNode) insn;
-                var evaluation = decoder.evaluate(decoder.target(call), args);
-                result = new Outcome(evaluation.text(), evaluation.literals(), "static string decoder", "", false);
+                boolean external = !call.owner.equals(owner);
+                var target = external ? index.find(call.owner) : new DecoderIndex.Owner(decoder, true);
+                if (!target.inertInitialization()) {
+                    result = new Outcome("Decoder owner may run class initialization", false);
+                } else {
+                    var evaluation = target.decoder().evaluate(target.decoder().entry(call, external), args);
+                    result = new Outcome(evaluation.text(), evaluation.literals(), "static string decoder", "", false);
+                }
             }
         } catch (Decoder.Unsupported unsupported) {
             result = new Outcome(unsupported.getMessage(), false);
@@ -159,13 +181,22 @@ final class StringRecovery implements Opcodes {
         boolean emitsCharacters = result.text.identity() == Decoder.Identity.FRESH
                 || result.text.identity() == Decoder.Identity.BUILDER_RESULT;
         int length = result.text.value().length();
-        if (result.text.identity() == Decoder.Identity.BORROWED || Rewrites.annotated(insn)
-                || emitsCharacters && (length > MAX_FRESH || length > freshUnits)
-                || literal != null && !literal.replace(method.instructions, new Strings.Decoded(result.reason, result.text.value()))) {
+        int growth = emitsCharacters ? 24 + 8 * length : 3;
+        growth += result.literals.size() * 4 + (parameters == null ? 0 : parameters.length);
+        String reason = null;
+        if (result.text.identity() == Decoder.Identity.BORROWED) reason = "Replacement may change string identity";
+        else if (growth > remainingCodeBytes) reason = "Replacement may exceed JVM method code size";
+        else if (emitsCharacters && (length > MAX_FRESH || length > freshUnits)) reason = "Replacement exceeds fresh string size budget";
+        else if (Rewrites.annotated(insn) || literal != null
+                && !literal.replace(method.instructions, new Strings.Decoded(result.reason, result.text.value()))) {
+            reason = "Replacement would remove an instruction annotation";
+        }
+        if (reason != null) {
             skipped++;
-            log(method, index, "skipped", "Replacement exceeds size limits, could change identity, or removes an instruction annotation", "");
+            log(method, index, "skipped", reason, "");
             return null;
         }
+        remainingCodeBytes -= growth;
         if (emitsCharacters) freshUnits -= length;
         if (literal == null) replace(method.instructions, insn, parameters, result);
         proposed++;

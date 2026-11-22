@@ -44,7 +44,27 @@ final class Reconstruction {
             return true;
         }
 
-        var expected = staged.inventory().expected();
+        Path sourceStage = stage;
+        var inventory = staged.inventory();
+        if (rewrite) {
+            Path normalized = work.resolve("source-bytecode.jar");
+            try {
+                var view = SourceNames.build(stage, normalized, libraries);
+                if (view != null) {
+                    sourceStage = normalized;
+                    inventory = view.inventory();
+                    report.add("Identifiers renamed in decompiler input: " + view.aliases());
+                    report.add("Record layouts reconstructed in decompiler input: " + view.records());
+                    report.add("Record bootstrap calls lowered in decompiler input: " + view.recordCalls());
+                    Exports.table(destination.resolve("source-renames.tsv"), "kind\tclass\toriginal\tdescriptor\treplacement", view.rows());
+                } else {
+                    report.add("Identifiers renamed in decompiler input: 0");
+                }
+            } catch (IOException | RuntimeException | StackOverflowError failure) {
+                report.add("Decompiler input normalization skipped: " + Inspection.failure(failure));
+            }
+        }
+        var expected = inventory.expected();
         int release = options.sourceRelease(archive);
         report.add("Source target: Java " + release);
         if (release > Runtime.version().feature()) {
@@ -54,15 +74,16 @@ final class Reconstruction {
         boolean compare = options.command.equals("compare");
         String primaryName = compare || !options.engine.equals("cfr") ? "vineflower" : "cfr";
         Path primaryPath = destination.resolve(compare ? "vineflower" : "sources");
-        var primary = decompile(options, primaryName, compare ? primaryName : "primary", stage, primaryPath,
+        var primary = decompile(options, primaryName, compare ? primaryName : "primary", sourceStage, primaryPath,
                 expected, destination, work, libraries, release, report, progress);
         Path selected = primaryPath;
+        SourceQuality selectedQuality = primary.quality;
         Candidate second = null;
         Map<String, Path> selection = Exports.sourceFiles(primaryPath);
         boolean partial = primary.partial(options.compile);
         if (compare || options.engine.equals("auto") && (primary.backendCode != 0 || primary.quality.recoveryNeeded())) {
             Path cfrPath = destination.resolve("cfr");
-            Path cfrInput = stage;
+            Path cfrInput = sourceStage;
             List<Path> cfrLibraries = libraries;
             var cfrExpected = expected;
             var needed = primary.quality.recoveryUnits(expected.keySet());
@@ -74,10 +95,10 @@ final class Reconstruction {
                     subset.put(name, expected.get(name));
                 }
                 Path targets = work.resolve("cfr-targets.jar");
-                if (Exports.subset(stage, targets, roots)) {
+                if (Exports.subset(sourceStage, targets, roots)) {
                     cfrInput = targets;
                     cfrLibraries = new ArrayList<>(libraries);
-                    cfrLibraries.addFirst(stage);
+                    cfrLibraries.addFirst(sourceStage);
                     cfrExpected = subset;
                     report.add("Targeted CFR fallback for " + needed.size() + " source units");
                 }
@@ -94,15 +115,20 @@ final class Reconstruction {
             if ((!compare || options.project) && SourceQuality.copySelection(selection, original, merged)) {
                 SourceQuality verified = assess(options, merged, expected, destination, work, libraries, release,
                         "selected", report, progress);
+                boolean syntaxImproved = verified.missing < primary.quality.missing
+                        || verified.syntaxErrors < primary.quality.syntaxErrors
+                        || verified.validSyntax > primary.quality.validSyntax;
                 boolean acceptable = verified.missing <= primary.quality.missing
                         && verified.syntaxErrors <= primary.quality.syntaxErrors
                         && verified.placeholders <= primary.quality.placeholders
-                        && verified.compilationErrors <= primary.quality.compilationErrors
+                        && (syntaxImproved || verified.compiled || !options.compile
+                        || verified.compilationErrors <= primary.quality.compilationErrors
                         && verified.unresolved <= primary.quality.unresolved
-                        && verified.missingDependencies <= primary.quality.missingDependencies
+                        && verified.missingDependencies <= primary.quality.missingDependencies)
                         && (!primary.quality.checked || verified.checked)
                         && (!primary.quality.compiled || verified.compiled);
                 if (acceptable) {
+                    selectedQuality = verified;
                     if (compare) {
                         selected = merged;
                     } else {
@@ -119,7 +145,27 @@ final class Reconstruction {
             }
         }
 
-        qualityTable(destination.resolve("source-quality.tsv"), expected.keySet(), primaryName, primary, second, selection);
+        if (compare && !options.project) selection = Exports.sourceFiles(primaryPath);
+        if (options.compile && selectedQuality.checked && selectedQuality.syntaxErrors != 0
+                && selectedQuality.validSyntax != 0 && release <= Runtime.version().feature()) {
+            Path parseable = Files.createDirectory(work.resolve("parseable-sources"));
+            for (var entry : Exports.sourceFiles(selected).entrySet()) {
+                var unit = selectedQuality.units.get(entry.getKey());
+                if (unit == null || !unit.parsed() || unit.syntax()) continue;
+                var target = parseable.resolve(entry.getKey());
+                Files.createDirectories(target.getParent());
+                Files.copy(entry.getValue(), target);
+            }
+            report.add("Compiling only syntax-valid files for additional diagnostics (excluded units can cause unresolved symbols)");
+            if (compile(options, parseable, destination, work, libraries, release, "valid-syntax", report, progress)) {
+                report.add("Files in the syntax-valid subset compiling together: " + selectedQuality.validSyntax);
+            }
+        }
+        report.add("Selected source quality: " + selectedQuality.summary());
+        if (options.compile) report.add("Files verified by full-tree compilation: "
+                + (selectedQuality.compiled ? selectedQuality.emitted : 0));
+        qualityTable(destination.resolve("source-quality.tsv"), expected.keySet(), primaryName, primary, second, selection,
+                selectedQuality, options.compile);
         if (!options.compile) report.add("Source compilation: not requested");
         if (options.project) {
             progress.println("Reconstructing an offline Gradle project");
@@ -151,7 +197,8 @@ final class Reconstruction {
         Path compileReport = options.compile ? destination.resolve("javac-" + label + ".tsv") : null;
         boolean compiled = options.compile && compile(options, sources, destination, work, libraries, release,
                 label, report, progress);
-        var assessment = new SourceQuality(sources, expected, syntaxReport, compileReport, syntax.code() == 0, compiled);
+        var assessment = new SourceQuality(sources, expected, syntaxReport, compileReport,
+                !syntax.status().equals("timed out"), compiled);
         report.add("Source quality " + label + ": " + assessment.summary());
         return assessment;
     }
@@ -176,7 +223,8 @@ final class Reconstruction {
     }
 
     private static void qualityTable(Path file, Set<String> expected, String primaryName, Candidate primary,
-                                     Candidate secondary, Map<String, Path> selection) throws IOException {
+                                     Candidate secondary, Map<String, Path> selection, SourceQuality verified,
+                                     boolean compileRequested) throws IOException {
         var names = new TreeSet<>(primary.quality.units.keySet());
         if (secondary != null) names.addAll(secondary.quality.units.keySet());
         var rows = new ArrayList<String>();
@@ -185,11 +233,17 @@ final class Reconstruction {
             var second = secondary == null ? null : secondary.quality.units.get(name);
             Path chosen = selection.get(name);
             String backend = chosen == null ? "" : chosen.startsWith(primary.path) ? primaryName : "cfr";
+            var unit = verified.units.get(name);
+            String syntax = unit == null || unit.path() == null ? "missing"
+                    : unit.syntax() ? "invalid" : unit.parsed() ? "valid" : "unverified";
+            String compilation = !compileRequested ? "not requested" : unit == null || unit.path() == null ? "missing"
+                    : verified.compiled ? "passed" : "unverified";
             rows.add(Inspection.row(name, expected.contains(name) ? "expected" : "additional",
                     first == null ? "missing source" : first.issue(),
-                    second == null ? "not attempted" : second.issue(), backend));
+                    second == null ? "not attempted" : second.issue(), backend, syntax, compilation,
+                    unit == null ? "" : unit.issue()));
         }
         Exports.table(file, "source\tinventory\t" + primaryName + "\t"
-                + (secondary == null ? "alternate" : "cfr") + "\tselected", rows);
+                + (secondary == null ? "alternate" : "cfr") + "\tselected\tsyntax\tcompilation\tselected_issues", rows);
     }
 }

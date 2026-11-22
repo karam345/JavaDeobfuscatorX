@@ -50,12 +50,19 @@ final class Decoder implements Opcodes {
     private final int version;
     private final Map<MethodKey, MethodNode> methods = new HashMap<>();
     private final Map<FieldKey, Object> constants = new HashMap<>();
-    private int classSteps = 100_000;
+    private final DecoderIndex.Budget archiveBudget;
+    private int classSteps;
     private int classUnits = 512_000;
 
     Decoder(ClassNode node) {
+        this(node, null);
+    }
+
+    Decoder(ClassNode node, DecoderIndex.Budget archiveBudget) {
         owner = node.name;
         version = node.version & 0xffff;
+        this.archiveBudget = archiveBudget;
+        classSteps = archiveBudget == null ? 100_000 : 2_000_000;
         if ((node.access & ACC_INTERFACE) != 0 || node.methods.stream().noneMatch(Decoder::stringDecoder)) return;
         for (var method : node.methods) {
             if (methods.put(new MethodKey(method.name, method.desc), method) != null) {
@@ -67,7 +74,7 @@ final class Decoder implements Opcodes {
     }
 
     private static boolean stringDecoder(MethodNode method) {
-        return (method.access & (ACC_PRIVATE | ACC_STATIC)) == (ACC_PRIVATE | ACC_STATIC)
+        return (method.access & ACC_STATIC) != 0
                 && method.desc.endsWith(")Ljava/lang/String;");
     }
 
@@ -98,6 +105,13 @@ final class Decoder implements Opcodes {
         if (call.getOpcode() != INVOKESTATIC || call.itf || !call.owner.equals(owner) || call.name.startsWith("<")) return null;
         var method = methods.get(new MethodKey(call.name, call.desc));
         return method != null && (method.access & (ACC_PRIVATE | ACC_STATIC)) == (ACC_PRIVATE | ACC_STATIC) ? method : null;
+    }
+
+    MethodNode entry(MethodInsnNode call, boolean external) {
+        if (call.getOpcode() != INVOKESTATIC || call.itf || !call.owner.equals(owner) || call.name.startsWith("<")) return null;
+        var method = methods.get(new MethodKey(call.name, call.desc));
+        int flags = external ? ACC_PUBLIC | ACC_STATIC : ACC_STATIC;
+        return method != null && (method.access & flags) == flags ? method : null;
     }
 
     Evaluation evaluate(MethodNode method, List<?> inputs) throws AnalyzerException {
@@ -132,7 +146,9 @@ final class Decoder implements Opcodes {
             }
 
             for (var insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
-                if (--steps < 0 || --classSteps < 0) throw new Unsupported("Decoder instruction budget exhausted");
+                if (--steps < 0 || --classSteps < 0 || archiveBudget != null && !archiveBudget.takeStep()) {
+                    throw new Unsupported("Decoder instruction budget exhausted");
+                }
                 int opcode = insn.getOpcode();
                 if (opcode < 0) continue;
                 if (opcode == ARETURN || opcode == IRETURN || opcode == LRETURN) {

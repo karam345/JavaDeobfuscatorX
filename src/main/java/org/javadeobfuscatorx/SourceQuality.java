@@ -13,13 +13,14 @@ import java.util.Set;
 import java.util.TreeSet;
 
 final class SourceQuality {
-    record Unit(Path path, int missingDeclarations, boolean syntax, boolean stub,
+    record Unit(Path path, Set<String> declarations, int missingDeclarations, boolean parsed, boolean syntax, boolean stub,
                 boolean compilation, boolean unresolved, boolean missingDependency) {
         String issue() {
             if (path == null) return "missing source";
             var issues = new ArrayList<String>();
             if (missingDeclarations != 0) issues.add("missing declarations " + missingDeclarations);
             if (syntax) issues.add("syntax error");
+            else if (!parsed) issues.add("syntax not verified");
             if (stub) issues.add("decompiler failure marker");
             if (compilation) issues.add("compilation error");
             if (unresolved) issues.add("unresolved symbol");
@@ -28,12 +29,18 @@ final class SourceQuality {
         }
 
         int compare(Unit other) {
-            if (path == null || other.path == null) return Boolean.compare(path == null, other.path == null);
-            int result = Boolean.compare(syntax, other.syntax);
-            if (result == 0) result = Integer.compare(missingDeclarations, other.missingDeclarations);
-            if (result == 0) result = Boolean.compare(stub, other.stub);
+            int result = compareStructure(other);
             if (result == 0) result = Boolean.compare(compilation, other.compilation);
             if (result == 0) result = Boolean.compare(unresolved, other.unresolved);
+            return result;
+        }
+
+        int compareStructure(Unit other) {
+            if (path == null || other.path == null) return Boolean.compare(path == null, other.path == null);
+            int result = Boolean.compare(syntax, other.syntax);
+            if (result == 0) result = Boolean.compare(other.parsed, parsed);
+            if (result == 0) result = Integer.compare(missingDeclarations, other.missingDeclarations);
+            if (result == 0) result = Boolean.compare(stub, other.stub);
             return result;
         }
     }
@@ -47,17 +54,20 @@ final class SourceQuality {
     final int compilationErrors;
     final int unresolved;
     final int missingDependencies;
+    final int emitted;
+    final int validSyntax;
+    final int validDeclarations;
     final boolean checked;
     final boolean compiled;
 
     SourceQuality(Path source, Map<String, Set<String>> expected, Path syntaxReport, Path compileReport,
-                  boolean parsedCompletely, boolean compiled) throws IOException {
+                  boolean syntaxWorkerFinished, boolean compiled) throws IOException {
         var files = Exports.sourceFiles(source);
         var types = new HashMap<String, Set<String>>();
         var diagnostics = new HashSet<Diagnostic>();
         load(syntaxReport, types, diagnostics);
         load(compileReport, types, diagnostics);
-        checked = parsedCompletely;
+        checked = syntaxWorkerFinished && diagnostics.contains(new Diagnostic("parse-complete", ""));
         this.compiled = compiled;
         var paths = new TreeSet<>(expected.keySet());
         paths.addAll(files.keySet());
@@ -67,12 +77,16 @@ final class SourceQuality {
         int compile = 0;
         int unresolvedSymbols = 0;
         int dependency = 0;
+        int valid = 0;
+        int declarations = 0;
         for (String name : paths) {
             Path file = files.get(name);
             var found = types.getOrDefault(name, Set.of());
             int absent = (int) expected.getOrDefault(name, Set.of()).stream().filter(type -> !found.contains(type)).count();
             if (absent != 0) coverage++;
-            boolean syntax = diagnostics.contains(new Diagnostic("syntax", name));
+            boolean parsed = checked && diagnostics.contains(new Diagnostic("parsed", name));
+            boolean syntax = diagnostics.contains(new Diagnostic("syntax", name))
+                    || diagnostics.contains(new Diagnostic("invalid-syntax", name));
             boolean compilation = diagnostics.contains(new Diagnostic("compilation", name));
             boolean unresolved = diagnostics.contains(new Diagnostic("unresolved-symbol", name));
             boolean missingDependency = diagnostics.contains(new Diagnostic("missing-dependency", name));
@@ -82,7 +96,11 @@ final class SourceQuality {
             if (unresolved) unresolvedSymbols++;
             if (missingDependency) dependency++;
             if (stub) stubs++;
-            units.put(name, new Unit(file, absent, syntax, stub, compilation, unresolved, missingDependency));
+            if (file != null && parsed && !syntax) {
+                valid++;
+                if (!stub) declarations += expected.getOrDefault(name, Set.of()).size() - absent;
+            }
+            units.put(name, new Unit(file, found, absent, parsed, syntax, stub, compilation, unresolved, missingDependency));
         }
         missing = coverage;
         syntaxErrors = invalidSyntax;
@@ -90,6 +108,9 @@ final class SourceQuality {
         compilationErrors = compile + (diagnostics.contains(new Diagnostic("compilation", "")) ? 1 : 0);
         unresolved = unresolvedSymbols + (diagnostics.contains(new Diagnostic("unresolved-symbol", "")) ? 1 : 0);
         missingDependencies = dependency + (diagnostics.contains(new Diagnostic("missing-dependency", "")) ? 1 : 0);
+        emitted = files.size();
+        validSyntax = valid;
+        validDeclarations = declarations;
     }
 
     boolean recoveryNeeded() {
@@ -100,13 +121,16 @@ final class SourceQuality {
         var needed = new TreeSet<String>();
         for (String name : expected) {
             var unit = units.get(name);
-            if (unit == null || unit.path == null || unit.missingDeclarations != 0 || unit.syntax || unit.stub) needed.add(name);
+            if (unit == null || unit.path == null || unit.missingDeclarations != 0 || !unit.parsed || unit.syntax || unit.stub
+                    || unit.compilation || unit.unresolved) needed.add(name);
         }
         return needed;
     }
 
     String summary() {
-        return missing + " incomplete source units, " + syntaxErrors + " with syntax errors, "
+        return emitted + " source files emitted, " + validSyntax + " with verified Java syntax, "
+                + validDeclarations + " expected named class declarations in valid, non-stub files, "
+                + missing + " incomplete source units, " + syntaxErrors + " with syntax errors, "
                 + placeholders + " with decompiler failure markers, " + compilationErrors + " with compilation errors, "
                 + unresolved + " with unresolved symbols, " + missingDependencies + " with missing dependencies"
                 + (checked ? "" : " (syntax pass incomplete or failed)");
@@ -117,13 +141,19 @@ final class SourceQuality {
         var choices = new LinkedHashMap<String, Path>();
         boolean wholeAlternative = !alternative.recoveryNeeded() && compileRequested && alternative.compiled
                 && !primary.compiled;
+        boolean comparableJavac = compileRequested && primary.checked && alternative.checked
+                && primary.syntaxErrors == 0 && alternative.syntaxErrors == 0 && primary.missing == 0 && alternative.missing == 0;
         primary.units.forEach((name, unit) -> {
             if (!wholeAlternative && unit.path != null) choices.put(name, unit.path);
         });
         alternative.units.forEach((name, unit) -> {
             Unit original = primary.units.get(name);
-            if (unit.path != null && (wholeAlternative || expected.contains(name)
-                    && (original == null || unit.compare(original) < 0))) choices.put(name, unit.path);
+            if (unit.path != null && (wholeAlternative || expected.contains(name) && unit.parsed && !unit.syntax
+                    && (original == null || (comparableJavac ? unit.compare(original) : unit.compareStructure(original)) < 0 && (original.syntax
+                    || original.missingDeclarations > 0 && unit.missingDeclarations == 0
+                    || unit.declarations.containsAll(original.declarations))))) {
+                choices.put(name, unit.path);
+            }
         });
         return choices;
     }

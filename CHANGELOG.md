@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Simplify predicates with proven integer bits and retain independent rewrites when a method needs an unavailable class hierarchy.
+- Recover deterministic strings from verified same-archive static helpers with bounded analysis and class initialization checks.
+- Reconstruct stripped record layouts and normalize JVM-only symbols in decompiler input. Revalidate selected source trees and report syntax and compilation separately.
+
 ## 0.3.0
 
 - Recover strings from proven private static decoder paths with constant inputs, bounded loops, local arrays, arithmetic, nested calls, and supported Base64 and hex decoding.
