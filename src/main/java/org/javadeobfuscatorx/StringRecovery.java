@@ -69,6 +69,13 @@ final class StringRecovery implements Opcodes {
         return insn instanceof MethodInsnNode call && decoder.target(call) != null && Type.getReturnType(call.desc).equals(STRING);
     }
 
+    boolean hasCandidate(AbstractInsnNode[] instructions) {
+        for (var instruction : instructions) {
+            if (candidate(instruction) || Strings.literalSite(instruction) != null) return true;
+        }
+        return false;
+    }
+
     String infer(AbstractInsnNode insn, List<? extends ConstantFlow.Fact> values) {
         if (!candidate(insn)) return null;
         var result = evaluate(insn, values);
@@ -149,16 +156,17 @@ final class StringRecovery implements Opcodes {
             return null;
         }
         decoded++;
-        boolean fresh = result.text.identity() == Decoder.Identity.FRESH;
+        boolean emitsCharacters = result.text.identity() == Decoder.Identity.FRESH
+                || result.text.identity() == Decoder.Identity.BUILDER_RESULT;
         int length = result.text.value().length();
         if (result.text.identity() == Decoder.Identity.BORROWED || Rewrites.annotated(insn)
-                || fresh && (length > MAX_FRESH || length > freshUnits)
+                || emitsCharacters && (length > MAX_FRESH || length > freshUnits)
                 || literal != null && !literal.replace(method.instructions, new Strings.Decoded(result.reason, result.text.value()))) {
             skipped++;
             log(method, index, "skipped", "Replacement exceeds size limits, could change identity, or removes an instruction annotation", "");
             return null;
         }
-        if (fresh) freshUnits -= length;
+        if (emitsCharacters) freshUnits -= length;
         if (literal == null) replace(method.instructions, insn, parameters, result);
         proposed++;
         log(method, index, "proposed", result.change, result.text.value());
@@ -187,6 +195,17 @@ final class StringRecovery implements Opcodes {
             replacement.add(new InsnNode(DUP));
             replacement.add(Strings.characters(text.value()));
             replacement.add(new MethodInsnNode(INVOKESPECIAL, "java/lang/String", "<init>", "([C)V", false));
+        } else if (text.identity() == Decoder.Identity.BUILDER_RESULT) {
+            // Keep the runtime's StringBuilder.toString identity behavior, especially for empty text.
+            String builder = "java/lang/StringBuilder";
+            replacement.add(new TypeInsnNode(NEW, builder));
+            replacement.add(new InsnNode(DUP));
+            replacement.add(new MethodInsnNode(INVOKESPECIAL, builder, "<init>", "()V", false));
+            if (!text.value().isEmpty()) {
+                replacement.add(Strings.characters(text.value()));
+                replacement.add(new MethodInsnNode(INVOKEVIRTUAL, builder, "append", "([C)Ljava/lang/StringBuilder;", false));
+            }
+            replacement.add(new MethodInsnNode(INVOKEVIRTUAL, builder, "toString", "()Ljava/lang/String;", false));
         } else {
             replacement.add(new LdcInsnNode(text.value()));
         }

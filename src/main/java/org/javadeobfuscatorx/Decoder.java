@@ -27,15 +27,19 @@ import java.util.Map;
 
 /** Interprets one proven path using only local memory and explicitly modeled operations. */
 final class Decoder implements Opcodes {
-    enum Identity { INTERNED, FRESH, BORROWED }
+    enum Identity { INTERNED, FRESH, BORROWED, BUILDER_RESULT }
     record Text(String value, Identity identity) {}
     record Evaluation(Text text, List<String> literals) {}
     private record MethodKey(String name, String descriptor) {}
+    private record FieldKey(String name, String descriptor) {}
     private record Slot(Object data) implements Value {
         @Override public int getSize() { return data instanceof Long ? 2 : 1; }
     }
     private static final class Allocation {
         Text text;
+    }
+    private static final class BuilderAllocation {
+        StringBuilder contents;
     }
     static final class Unsupported extends RuntimeException {
         Unsupported(String reason) { super(reason, null, false, false); }
@@ -45,17 +49,47 @@ final class Decoder implements Opcodes {
     private final String owner;
     private final int version;
     private final Map<MethodKey, MethodNode> methods = new HashMap<>();
+    private final Map<FieldKey, Object> constants = new HashMap<>();
     private int classSteps = 100_000;
     private int classUnits = 512_000;
 
     Decoder(ClassNode node) {
         owner = node.name;
         version = node.version & 0xffff;
-        if ((node.access & ACC_INTERFACE) != 0) return;
+        if ((node.access & ACC_INTERFACE) != 0 || node.methods.stream().noneMatch(Decoder::stringDecoder)) return;
         for (var method : node.methods) {
             if (methods.put(new MethodKey(method.name, method.desc), method) != null) {
                 methods.clear();
                 break;
+            }
+        }
+        if (!methods.isEmpty()) indexConstants(node);
+    }
+
+    private static boolean stringDecoder(MethodNode method) {
+        return (method.access & (ACC_PRIVATE | ACC_STATIC)) == (ACC_PRIVATE | ACC_STATIC)
+                && method.desc.endsWith(")Ljava/lang/String;");
+    }
+
+    private void indexConstants(ClassNode node) {
+        for (var field : node.fields) {
+            int flags = ACC_PRIVATE | ACC_STATIC | ACC_FINAL;
+            if ((field.access & flags) != flags) continue;
+            Object value = switch (field.desc) {
+                case "I" -> field.value instanceof Integer integer ? integer : null;
+                case "J" -> field.value instanceof Long wide ? wide : null;
+                case "Ljava/lang/String;" -> field.value instanceof String text && text.length() <= Strings.LIMIT
+                        ? new Text(text, Identity.INTERNED) : null;
+                default -> null;
+            };
+            if (value != null) constants.put(new FieldKey(field.name, field.desc), value);
+        }
+        if (constants.isEmpty()) return;
+        for (var method : node.methods) {
+            for (var insn : method.instructions) {
+                if (insn instanceof FieldInsnNode write && write.getOpcode() == PUTSTATIC && write.owner.equals(owner)) {
+                    constants.remove(new FieldKey(write.name, write.desc));
+                }
             }
         }
     }
@@ -153,12 +187,19 @@ final class Decoder implements Opcodes {
                     case Long wide -> new Slot(wide);
                     default -> throw opcode(insn);
                 };
-                case NEW -> {
-                    if (!((TypeInsnNode) insn).desc.equals("java/lang/String")) throw opcode(insn);
-                    yield new Slot(new Allocation());
-                }
+                case NEW -> switch (((TypeInsnNode) insn).desc) {
+                    case "java/lang/String" -> new Slot(new Allocation());
+                    case "java/lang/StringBuilder" -> {
+                        if (version < V1_5) throw new Unsupported("StringBuilder is newer than the classfile target");
+                        yield new Slot(new BuilderAllocation());
+                    }
+                    default -> throw opcode(insn);
+                };
                 case GETSTATIC -> {
-                    Charset charset = Strings.charset((FieldInsnNode) insn);
+                    var read = (FieldInsnNode) insn;
+                    Object constant = read.owner.equals(owner) ? constants.get(new FieldKey(read.name, read.desc)) : null;
+                    if (constant != null) yield new Slot(constant);
+                    Charset charset = Strings.charset(read);
                     if (charset == null || version < V1_7) throw new Unsupported("Decoder reads unsupported static state");
                     yield new Slot(charset);
                 }
@@ -254,6 +295,10 @@ final class Decoder implements Opcodes {
                 allocate(text.length());
                 return new Slot(decoder.decode(text));
             }
+            if (call.owner.equals("java/lang/StringBuilder") && !call.itf && !values.isEmpty()
+                    && values.getFirst().data() instanceof BuilderAllocation builder) {
+                return builderOperation(call, values, builder);
+            }
             if (!call.owner.equals("java/lang/String") || call.itf) throw new Unsupported("Decoder calls an unsupported method");
             if (call.getOpcode() == INVOKESPECIAL && call.name.equals("<init>")) {
                 if (!(values.getFirst().data() instanceof Allocation allocation) || allocation.text != null) throw opcode(insn);
@@ -278,6 +323,64 @@ final class Decoder implements Opcodes {
                 }
                 default -> throw new Unsupported("Decoder calls an unsupported String operation");
             };
+        }
+
+        private Slot builderOperation(MethodInsnNode call, List<? extends Slot> values, BuilderAllocation builder) {
+            if (call.getOpcode() == INVOKESPECIAL && call.name.equals("<init>") && builder.contents == null) {
+                builder.contents = switch (call.desc) {
+                    case "()V" -> new StringBuilder();
+                    case "(I)V" -> {
+                        int capacity = integer(values.get(1));
+                        if (capacity < 0) throw new NegativeArraySizeException();
+                        allocate(capacity);
+                        yield new StringBuilder(capacity);
+                    }
+                    case "(Ljava/lang/String;)V" -> {
+                        String value = asText(values.get(1).data()).value;
+                        allocate(value.length());
+                        yield new StringBuilder(value);
+                    }
+                    default -> throw new Unsupported("Unsupported StringBuilder constructor");
+                };
+                return null;
+            }
+            if (call.getOpcode() != INVOKEVIRTUAL || builder.contents == null) throw opcode(call);
+            if (call.name.equals("toString") && call.desc.equals("()Ljava/lang/String;")) {
+                allocate(builder.contents.length());
+                return new Slot(new Text(builder.contents.toString(), Identity.BUILDER_RESULT));
+            }
+            if (call.name.equals("reverse") && call.desc.equals("()Ljava/lang/StringBuilder;")) {
+                allocate(builder.contents.length());
+                builder.contents.reverse();
+                return values.getFirst();
+            }
+            if (!call.name.equals("append") || !call.desc.endsWith(")Ljava/lang/StringBuilder;")) throw opcode(call);
+            Slot argument = values.size() == 2 ? values.get(1) : EMPTY;
+            String text = switch (call.desc) {
+                case "(Ljava/lang/String;)Ljava/lang/StringBuilder;" -> argument.data == StringRecovery.NULL
+                        ? "null" : asText(argument.data).value;
+                case "(I)Ljava/lang/StringBuilder;" -> Integer.toString(integer(argument));
+                case "(J)Ljava/lang/StringBuilder;" -> {
+                    if (!(argument.data instanceof Long value)) throw opcode(call);
+                    yield value.toString();
+                }
+                case "(C)Ljava/lang/StringBuilder;" -> {
+                    int value = integer(argument);
+                    if (value != (char) value) throw opcode(call);
+                    yield Character.toString((char) value);
+                }
+                case "(Z)Ljava/lang/StringBuilder;" -> switch (integer(argument)) {
+                    case 0 -> "false";
+                    case 1 -> "true";
+                    default -> throw opcode(call);
+                };
+                case "([C)Ljava/lang/StringBuilder;" -> new String((char[]) argument.data);
+                default -> throw new Unsupported("Unsupported StringBuilder append overload");
+            };
+            if (text.length() > Strings.LIMIT - builder.contents.length()) throw new Unsupported("StringBuilder text budget exhausted");
+            allocate(text.length());
+            builder.contents.append(text);
+            return values.getFirst();
         }
 
         private Slot fresh(String text) {

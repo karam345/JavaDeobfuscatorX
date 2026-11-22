@@ -25,6 +25,12 @@ final class Bytecode {
     record Result(byte[] bytes, Map<String, Integer> changes, String rollback,
                   StringRecovery.Counts strings, List<String> stringSites) {}
     private record MethodKey(String name, String descriptor) {}
+    private record Pass(Map<MethodKey, MethodNode> replacements, Map<String, Integer> counts) {
+        boolean changedControlFlow() {
+            return counts.keySet().stream().anyMatch(change -> change.contains("jump") || change.contains("branch")
+                    || change.contains("switch") || change.contains("handler") || change.equals("unreachable instruction"));
+        }
+    }
 
     static ClassNode parse(byte[] bytes) {
         var node = new ClassNode();
@@ -99,27 +105,26 @@ final class Bytecode {
                 return new Result(original, Map.of(), "Custom attributes", StringRecovery.Counts.EMPTY, List.of());
             }
             verify(node);
-            strings = new StringRecovery(node);
             boolean flow = (node.version & 0xffff) >= 51;
             for (int pass = 0; pass < PASSES; pass++) {
-                var replacements = new HashMap<MethodKey, MethodNode>();
-                var counts = new TreeMap<String, Integer>();
-                for (MethodNode method : node.methods) {
-                    var applied = Rewrites.apply(node.name, method, flow, pass == 0 ? strings : null);
-                    if (!applied.isEmpty()) {
-                        replacements.put(new MethodKey(method.name, method.desc), method);
-                        applied.forEach((key, value) -> counts.merge(key, value, Integer::sum));
-                    }
-                }
-                if (replacements.isEmpty()) break;
-                byte[] candidate = write(verified, replacements, hierarchy, counts.keySet().stream().anyMatch(
-                        change -> change.contains("jump") || change.contains("branch") || change.contains("switch")
-                                || change.contains("handler") || change.equals("unreachable instruction")) && flow);
+                var numeric = rewrite(node, flow, null);
+                if (numeric.replacements.isEmpty()) break;
+                byte[] candidate = write(verified, numeric.replacements, hierarchy, flow && numeric.changedControlFlow());
                 node = parse(candidate);
                 verify(node);
                 verified = candidate;
+                numeric.counts.forEach((key, value) -> changes.merge(key, value, Integer::sum));
+            }
+
+            // A branch removed by a verified pass can expose constant inputs at a later join.
+            strings = new StringRecovery(node);
+            var stringPass = rewrite(node, false, strings);
+            if (!stringPass.replacements.isEmpty()) {
+                byte[] candidate = write(verified, stringPass.replacements, hierarchy, false);
+                verify(candidate);
+                verified = candidate;
                 stringsCommitted = true;
-                counts.forEach((key, value) -> changes.merge(key, value, Integer::sum));
+                stringPass.counts.forEach((key, value) -> changes.merge(key, value, Integer::sum));
             }
             return new Result(verified, changes, null, strings.counts(stringsCommitted), strings.rows(owner, stringsCommitted));
         } catch (AnalyzerException | RuntimeException | StackOverflowError failure) {
@@ -127,6 +132,19 @@ final class Bytecode {
                     strings == null ? StringRecovery.Counts.EMPTY : strings.counts(stringsCommitted),
                     strings == null ? List.of() : strings.rows(owner, stringsCommitted));
         }
+    }
+
+    private static Pass rewrite(ClassNode node, boolean flow, StringRecovery strings) throws AnalyzerException {
+        var replacements = new HashMap<MethodKey, MethodNode>();
+        var counts = new TreeMap<String, Integer>();
+        for (MethodNode method : node.methods) {
+            var applied = Rewrites.apply(node.name, method, flow, strings);
+            if (!applied.isEmpty()) {
+                replacements.put(new MethodKey(method.name, method.desc), method);
+                applied.forEach((key, value) -> counts.merge(key, value, Integer::sum));
+            }
+        }
+        return new Pass(replacements, counts);
     }
 
     private static byte[] write(byte[] input, Map<MethodKey, MethodNode> replacements, Hierarchy hierarchy,

@@ -4,6 +4,9 @@
 
 - Recover strings from proven private static decoder paths with constant inputs, bounded loops, local arrays, arithmetic, nested calls, and supported Base64 and hex decoding.
 - Fold supported JDK string concatenation bootstrap recipes. Keep fresh results distinct and emit fresh text without interning it as a literal. Report detected, decoded, verified replacement, skipped and failed counts.
+- Recover Java 8-style concatenation in private static decoders with bounded local StringBuilder operations. Preserve the runtime's string identity behavior for empty builder output.
+- Resolve private static final ConstantValue reads in same-class decoders when bytecode never overwrites the field.
+- Recover decoder inputs exposed by proven branch removal in a separately verified string pass.
 - Bypass switch dispatchers on proven constant edges and reuse reachability information on unchanged control-flow graphs.
 - Target CFR recovery at incomplete source units when compilation was not requested. Recheck merged output for dependency and unresolved-symbol regressions.
 - Keep distinct javac errors from the same source file and report dependency hints for Minecraft APIs and server mappings.

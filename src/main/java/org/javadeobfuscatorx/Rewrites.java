@@ -27,6 +27,7 @@ final class Rewrites implements Opcodes {
         var code = method.instructions;
         if (code.size() == 0) return counts;
         var initial = code.toArray();
+        if (strings != null && !strings.hasCandidate(initial)) return counts;
         for (var insn : initial) {
             if (insn.getOpcode() == JSR || insn.getOpcode() == RET) return counts;
         }
@@ -40,13 +41,15 @@ final class Rewrites implements Opcodes {
             var frame = frames[i];
             if (insn.getOpcode() < 0) continue;
             if (frame == null) reachabilityChanged = true;
-            String change = strings == null ? null : strings.apply(method, insn, frame, i);
-            if (change == null && frame != null && !annotated(insn)) change = simplify(code, insn, frame, flow);
+            String change;
+            if (strings != null) change = strings.apply(method, insn, frame, i);
+            else change = frame == null || annotated(insn) ? null : simplify(code, insn, frame, flow);
             if (change != null) {
                 counts.merge(change, 1, Integer::sum);
                 reachabilityChanged |= insn instanceof JumpInsnNode || insn instanceof TableSwitchInsnNode || insn instanceof LookupSwitchInsnNode;
             }
         }
+        if (strings != null) return counts;
         int handlers = removeShadowedHandlers(method);
         if (handlers != 0) counts.put("shadowed exception handler", handlers);
         if (flow) normalize(owner, method, counts, reachabilityChanged || handlers != 0);

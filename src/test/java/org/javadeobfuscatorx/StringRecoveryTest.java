@@ -3,6 +3,7 @@ package org.javadeobfuscatorx;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Label;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
@@ -120,6 +121,48 @@ class StringRecoveryTest implements Opcodes {
     }
 
     @Test
+    void reconstructsJava8StringBuildersWithRuntimeSpecificEmptyIdentity() throws Exception {
+        byte[] fixture = compile("8", """
+                public class Sample {
+                    private static String concat(String value, int number, long wide, char separator, boolean flag) {
+                        return value + separator + number + ':' + wide + ':' + flag;
+                    }
+                    private static String reverse(String value) {
+                        StringBuilder builder = new StringBuilder(value);
+                        String snapshot = builder.reverse().append(new char[] {'!', '!'}).toString();
+                        builder.append('X');
+                        return snapshot;
+                    }
+                    private static String empty(int capacity) { return new StringBuilder(capacity).toString(); }
+                    public static String value() { return concat(null, -12, Long.MIN_VALUE, '/', true); }
+                    public static String unicode() { return reverse("A😀Ω"); }
+                    public static String blank() { return empty(8); }
+                    public static String badCapacity() { return empty(-1); }
+                }
+                """);
+        var result = rewrite(fixture);
+        assertNull(result.rollback(), result.rollback());
+        assertEquals(3, result.changes().get("static string decoder"));
+        assertEquals(1, result.strings().failed());
+        var rewritten = Bytecode.parse(result.bytes());
+        for (String name : new String[]{"value", "unicode", "blank"}) {
+            var method = rewritten.methods.stream().filter(item -> item.name.equals(name)).findFirst().orElseThrow();
+            assertFalse(java.util.Arrays.stream(method.instructions.toArray()).anyMatch(insn ->
+                    insn instanceof MethodInsnNode call && call.owner.equals("Sample")), name);
+        }
+        Class<?> before = load(fixture);
+        Class<?> after = load(result.bytes());
+        assertEquals("null/-12:-9223372036854775808:true", after.getMethod("value").invoke(null));
+        assertEquals("Ω😀A!!", after.getMethod("unicode").invoke(null));
+        Object originalEmpty = before.getMethod("blank").invoke(null);
+        Object rewrittenEmpty = after.getMethod("blank").invoke(null);
+        assertEquals(originalEmpty, rewrittenEmpty);
+        assertEquals(originalEmpty == "", rewrittenEmpty == "");
+        assertInstanceOf(NegativeArraySizeException.class,
+                assertThrows(InvocationTargetException.class, () -> after.getMethod("badCapacity").invoke(null)).getCause());
+    }
+
+    @Test
     void reportsRolledBackStringSitesWithoutCountingReplacements() throws Exception {
         var writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         writer.visit(V1_8, ACC_PUBLIC, "Sample", null, "java/lang/Object", null);
@@ -143,6 +186,76 @@ class StringRecoveryTest implements Opcodes {
         assertTrue(result.rollback().contains("MethodTooLarge"), result.rollback());
         assertEquals(new StringRecovery.Counts(1, 1, 0, 0, 1), result.strings());
         assertTrue(result.stringSites().getFirst().contains("rolled back"));
+    }
+
+    @Test
+    void followsSameClassConstantFieldsAndKeepsAnInitializerOverride() throws Exception {
+        var writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        writer.visit(V21, ACC_PUBLIC, "Sample", null, "java/lang/Object", null);
+        int flags = ACC_PRIVATE | ACC_STATIC | ACC_FINAL;
+        String string = "Ljava/lang/String;";
+        String returnsString = "()" + string;
+        writer.visitField(flags, "KEY", "I", null, 7).visitEnd();
+        writer.visitField(flags, "TEXT", string, null, "proven text").visitEnd();
+        writer.visitField(flags, "OVERRIDDEN", string, null, "wrong").visitEnd();
+        var clinit = writer.visitMethod(ACC_STATIC, "<clinit>", "()V", null, null);
+        clinit.visitCode();
+        clinit.visitLdcInsn("later value");
+        clinit.visitFieldInsn(PUTSTATIC, "Sample", "OVERRIDDEN", string);
+        clinit.visitInsn(RETURN);
+        clinit.visitMaxs(0, 0);
+        clinit.visitEnd();
+
+        var select = writer.visitMethod(ACC_PRIVATE | ACC_STATIC, "select", "(I)" + string, null, null);
+        select.visitCode();
+        var otherwise = new Label();
+        select.visitVarInsn(ILOAD, 0);
+        select.visitFieldInsn(GETSTATIC, "Sample", "KEY", "I");
+        select.visitJumpInsn(IF_ICMPNE, otherwise);
+        select.visitFieldInsn(GETSTATIC, "Sample", "TEXT", string);
+        select.visitInsn(ARETURN);
+        select.visitLabel(otherwise);
+        select.visitFieldInsn(GETSTATIC, "Sample", "OVERRIDDEN", string);
+        select.visitInsn(ARETURN);
+        select.visitMaxs(0, 0);
+        select.visitEnd();
+        for (int key : new int[]{7, 0}) {
+            var call = writer.visitMethod(ACC_PUBLIC | ACC_STATIC, "value" + key, returnsString, null, null);
+            call.visitCode();
+            call.visitIntInsn(BIPUSH, key);
+            call.visitMethodInsn(INVOKESTATIC, "Sample", "select", "(I)" + string, false);
+            call.visitInsn(ARETURN);
+            call.visitMaxs(0, 0);
+            call.visitEnd();
+        }
+        byte[] bytes = writer.toByteArray();
+        var result = rewrite(bytes);
+        assertNull(result.rollback(), result.rollback());
+        assertEquals(new StringRecovery.Counts(2, 1, 1, 1, 0), result.strings());
+        Class<?> loaded = load(result.bytes());
+        assertSame("proven text", loaded.getMethod("value7").invoke(null));
+        assertSame("later value", loaded.getMethod("value0").invoke(null));
+    }
+
+    @Test
+    void recoversAnArgumentExposedByVerifiedControlFlowSimplification() throws Exception {
+        byte[] fixture = compile("21", """
+                public class Sample {
+                    private static String select(int value) { return value == 7 ? "reachable" : "decoy"; }
+                    public static String value() {
+                        int predicate = 0;
+                        int argument;
+                        if (predicate == 0) argument = 7;
+                        else argument = 5;
+                        return select(argument);
+                    }
+                }
+                """);
+        var result = rewrite(fixture);
+        assertNull(result.rollback(), result.rollback());
+        assertTrue(result.changes().containsKey("constant branch"));
+        assertEquals(1, result.strings().replaced());
+        assertSame("reachable", load(result.bytes()).getMethod("value").invoke(null));
     }
 
     private byte[] compile(String release, String text) throws Exception {
