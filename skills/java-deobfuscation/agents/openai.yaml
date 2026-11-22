@@ -1,6 +1,9 @@
 interface:
   display_name: "JavaDeobfuscatorX"
   short_description: "Analyze and reconstruct Java JARs locally"
+  icon_small: "./assets/icon-64.png"
+  icon_large: "./assets/logo.svg"
+  brand_color: "#9265FF"
   default_prompt: "Use $java-deobfuscation to inspect this JAR and recover readable Java source."
 
 policy:

@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
@@ -19,7 +20,8 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 final class Exports {
-    record Staged(int classes, Map<String, Integer> changes, List<String> rollbacks, SourceInventory inventory) {}
+    record Staged(int classes, Map<String, Integer> changes, List<String> rollbacks, SourceInventory inventory,
+                  StringRecovery.Counts strings, List<String> stringSites) {}
     record SourceRun(int files, String status, int code) {}
 
     static Staged stage(Archive archive, Path output, boolean rewrite) throws IOException {
@@ -35,6 +37,8 @@ final class Exports {
         var changes = new TreeMap<String, Integer>();
         var rollbacks = new ArrayList<String>();
         var inventory = new SourceInventory();
+        var strings = StringRecovery.Counts.EMPTY;
+        var stringSites = new ArrayList<String>();
         int classes = 0;
         try (var zip = new ZipOutputStream(Files.newOutputStream(output));
              var libraries = new DecompilerWorker.Libraries(dependencies)) {
@@ -54,13 +58,16 @@ final class Exports {
                     data = result.bytes();
                     if (result.rollback() != null) rollbacks.add(Inspection.row(entry.name(), result.rollback()));
                     result.changes().forEach((key, count) -> changes.merge(key, count, Integer::sum));
+                    strings = strings.plus(result.strings());
+                    var rows = result.stringSites();
+                    stringSites.addAll(rows.subList(0, Math.min(rows.size(), 8192 - stringSites.size())));
                 }
                 put(zip, entry.path(), data);
                 inventory.add(node);
                 classes++;
             }
         }
-        return new Staged(classes, changes, rollbacks, inventory);
+        return new Staged(classes, changes, rollbacks, inventory, strings, stringSites);
     }
 
     private static void writeModuleIdentity(ZipOutputStream zip, Archive archive) throws IOException {
@@ -81,6 +88,17 @@ final class Exports {
                 put(zip, name, archive.read(archive.resources.get(name)));
             }
         }
+    }
+
+    static boolean subset(Path input, Path output, Set<String> roots) throws IOException {
+        try (var source = new java.util.zip.ZipFile(input.toFile())) {
+            // The full staged archive remains on CFR's lookup path for inner classes and dependencies.
+            if (roots.stream().anyMatch(name -> source.getEntry(name) == null)) return false;
+            try (var zip = new ZipOutputStream(Files.newOutputStream(output))) {
+                for (String name : roots) put(zip, name, DecompilerWorker.readClass(source, name));
+            }
+        }
+        return true;
     }
 
     private static void put(ZipOutputStream zip, String name, byte[] data) throws IOException {

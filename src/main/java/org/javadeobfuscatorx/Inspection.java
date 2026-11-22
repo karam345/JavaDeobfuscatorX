@@ -28,6 +28,7 @@ import java.util.function.Consumer;
 
 final class Inspection implements Opcodes {
     private static final int ROW_LIMIT = 50_000;
+    private static final java.util.regex.Pattern TSV_CONTROLS = java.util.regex.Pattern.compile("[\\p{Cc}\\p{Cf}\\p{Cs}]");
     private static final String[] VENDORS = {
         "Allatori", "Zelix KlassMaster", "Stringer", "DashO", "ProGuard", "R8", "yGuard",
         "Skidfuscator", "ClassGuard", "Radon", "Recaf"
@@ -38,6 +39,8 @@ final class Inspection implements Opcodes {
     final List<String> attribution = new ArrayList<>();
     final List<String> problems = new ArrayList<>();
     final List<String> references = new ArrayList<>();
+    final List<String> hierarchy = new ArrayList<>();
+    final List<String> calls = new ArrayList<>();
     final List<String> names = new ArrayList<>();
     final List<String> strings = new ArrayList<>();
     final List<String> bootstraps = new ArrayList<>();
@@ -103,6 +106,8 @@ final class Inspection implements Opcodes {
         };
         reference.accept(node.superName);
         node.interfaces.forEach(reference);
+        if (node.superName != null) add(hierarchy, row(node.name, "superclass", node.superName));
+        node.interfaces.forEach(name -> add(hierarchy, row(node.name, "interface", name)));
         minecraft.inspectClass(node);
         if (!shortName.contains("$") && suspicious(shortName)) {
             count("short or source-incompatible class name");
@@ -143,6 +148,7 @@ final class Inspection implements Opcodes {
             realInstructions++;
             if (insn instanceof MethodInsnNode call) {
                 calls++;
+                add(this.calls, row(node.name, method.name, method.desc, dispatch(call), call.owner, call.name, call.desc));
                 reference.accept(call.owner);
                 reference(Type.getMethodType(call.desc), reference);
                 minecraft.inspectCall(call);
@@ -199,9 +205,19 @@ final class Inspection implements Opcodes {
                     && Type.getArgumentTypes(method.desc).length == 0
                     && Type.getReturnType(method.desc).getDescriptor().equals(accessor.desc)
                     && realInstructions == (accessor.getOpcode() == GETFIELD ? 3 : 2);
-            suggest("method", node.name, method.name, method.desc, getter ? "getValue" : "method",
-                    getter ? "medium" : "low");
+            String accessorName = getter ? Identifiers.getterName(node, method, accessor) : null;
+            suggest("method", node.name, method.name, method.desc,
+                    accessorName != null ? accessorName : getter ? "getValue" : "method", getter ? "medium" : "low");
         }
+    }
+
+    private static String dispatch(MethodInsnNode call) {
+        return switch (call.getOpcode()) {
+            case INVOKESTATIC -> "static";
+            case INVOKESPECIAL -> "special";
+            case INVOKEINTERFACE -> "interface";
+            default -> "virtual";
+        };
     }
 
     private void decode(ClassNode node, MethodNode method, MethodInsnNode call) {
@@ -290,9 +306,8 @@ final class Inspection implements Opcodes {
     static String row(String... fields) {
         return String.join("\t", java.util.Arrays.stream(fields)
                 .map(field -> field.length() <= 4096 ? field : field.substring(0, 4096) + " [truncated]")
-                .map(field -> field.replace("\\", "\\\\").replace("\t", "\\t")
-                        .replace("\r", "\\r").replace("\n", "\\n")
-                        .replaceAll("[\\p{Cc}\\p{Cf}]", "?"))
+                .map(field -> TSV_CONTROLS.matcher(field.replace("\\", "\\\\").replace("\t", "\\t")
+                        .replace("\r", "\\r").replace("\n", "\\n")).replaceAll("?"))
                 .toList());
     }
 

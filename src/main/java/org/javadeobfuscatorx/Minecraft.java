@@ -167,6 +167,19 @@ final class Minecraft {
                 && call.name.equals("hasPermission")) signals.add("Permission check");
     }
 
+    static String dependencyHint(String diagnostic) {
+        if (diagnostic.contains("net.minecraft.") || diagnostic.contains("org.bukkit.craftbukkit.")) {
+            return "Supply the matching Minecraft server or game libraries with the original mapping namespace.";
+        }
+        if (diagnostic.contains("io.papermc.paper.threadedregions")) {
+            return "Supply the matching Paper or Folia API with region scheduler types.";
+        }
+        if (diagnostic.contains("io.papermc.paper.")) return "Supply the matching Paper API.";
+        if (diagnostic.contains("org.bukkit")) return "Supply the matching Bukkit, Spigot or Paper API.";
+        if (diagnostic.contains("com.velocitypowered.api")) return "Supply the matching Velocity API.";
+        return null;
+    }
+
     void finish(Set<String> classes) {
         for (String entrypoint : entrypoints) {
             metadata.add(Inspection.row("entrypoint", entrypoint, classes.contains(entrypoint) ? "present" : "missing in selected view"));

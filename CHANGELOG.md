@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Recover strings from proven private static decoder paths with constant inputs, bounded loops, local arrays, arithmetic, nested calls, and supported Base64 and hex decoding.
+- Fold supported JDK string concatenation bootstrap recipes. Keep fresh results distinct and emit fresh text without interning it as a literal. Report detected, decoded, verified replacement, skipped and failed counts.
+- Bypass switch dispatchers on proven constant edges and reuse reachability information on unchanged control-flow graphs.
+- Target CFR recovery at incomplete source units when compilation was not requested. Recheck merged output for dependency and unresolved-symbol regressions.
+- Keep distinct javac errors from the same source file and report dependency hints for Minecraft APIs and server mappings.
+- Export declared hierarchy and symbolic call edges. Use recognizable backing field names in private accessor suggestions.
+- Add original branding and validate the packaged Codex skill and icon paths in CI.
+
 ## 0.2.0
 
 - Propagate integer and long constants through locals, the stack and control-flow joins. Verify each rewrite pass and retain the last verified bytecode on failure.

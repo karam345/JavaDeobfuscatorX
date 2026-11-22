@@ -176,6 +176,53 @@ class AdvancedEngineTest implements Opcodes {
         assertEquals(7, load(result.bytes()).getMethod("scope", int.class).invoke(null, 7));
     }
 
+    @Test
+    void bypassesDispatcherForProvenEdgesAndRetainsUnknownDispatch() throws Exception {
+        var writer = fixture("Dispatcher");
+        var method = method(writer, "value", "(ZI)I");
+        var unknown = new Label();
+        var dispatch = new Label();
+        var zero = new Label();
+        var four = new Label();
+        var fallback = new Label();
+        method.visitVarInsn(ILOAD, 0);
+        method.visitJumpInsn(IFEQ, unknown);
+        method.visitInsn(ICONST_4);
+        method.visitVarInsn(ISTORE, 2);
+        method.visitJumpInsn(GOTO, dispatch);
+        method.visitLabel(unknown);
+        method.visitVarInsn(ILOAD, 1);
+        method.visitVarInsn(ISTORE, 2);
+        method.visitJumpInsn(GOTO, dispatch);
+        method.visitLabel(dispatch);
+        method.visitVarInsn(ILOAD, 2);
+        method.visitLookupSwitchInsn(fallback, new int[]{0, 4}, new Label[]{zero, four});
+        method.visitLabel(four);
+        method.visitInsn(ICONST_0);
+        method.visitVarInsn(ISTORE, 2);
+        method.visitJumpInsn(GOTO, dispatch);
+        method.visitLabel(zero);
+        method.visitIntInsn(BIPUSH, 42);
+        method.visitInsn(IRETURN);
+        method.visitLabel(fallback);
+        method.visitVarInsn(ILOAD, 2);
+        method.visitInsn(IRETURN);
+        end(method);
+        byte[] fixture = writer.toByteArray();
+        var result = transform("Dispatcher", fixture);
+        assertNull(result.rollback(), result.rollback());
+        assertEquals(2, result.changes().get("constant dispatcher jump"));
+        assertTrue(java.util.Arrays.stream(Bytecode.parse(result.bytes()).methods.getFirst().instructions.toArray())
+                .anyMatch(insn -> insn.getOpcode() == LOOKUPSWITCH));
+        var before = load(fixture).getMethod("value", boolean.class, int.class);
+        var after = load(result.bytes()).getMethod("value", boolean.class, int.class);
+        for (boolean known : new boolean[]{true, false}) {
+            for (int key : new int[]{0, 4, 7, Integer.MIN_VALUE}) {
+                assertEquals(before.invoke(null, known, key), after.invoke(null, known, key));
+            }
+        }
+    }
+
     private Bytecode.Result transform(String name, byte[] data) throws Exception {
         try (var archive = archive(name, data)) {
             return Bytecode.transform(data, new Hierarchy(archive));

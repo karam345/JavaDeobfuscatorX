@@ -32,6 +32,8 @@ class CliTest {
         assertTrue(Files.isRegularFile(output.resolve("sources/sample/a.java")));
         assertTrue(Files.isRegularFile(output.resolve("bytecode.jar")));
         assertTrue(Files.readString(output.resolve("strings.tsv")).contains("Synthetic fixture"));
+        assertTrue(Files.readString(output.resolve("calls.tsv")).contains("static\tjava/util/Base64\tgetDecoder"));
+        assertTrue(Files.readString(output.resolve("hierarchy.tsv")).contains("sample/a\tsuperclass\tjava/lang/Object"));
         try (var resources = new ZipFile(output.resolve("resources.zip").toFile())) {
             try (var stream = resources.getInputStream(resources.getEntry("plugin.yml"))) {
                 assertArrayEquals(descriptor, stream.readAllBytes());
@@ -52,6 +54,26 @@ class CliTest {
         assertTrue(Files.readString(output.resolve("comparison.tsv")).contains("sample/Demo.java\tdifferent UTF-8 bytes"));
         var verify = run("verify", "--sources", output.resolve("cfr").toString(), "--out", temp.resolve("verified").toString());
         assertEquals(0, verify.code, verify.log);
+    }
+
+    @Test
+    void cfrTargetsOneRootAndResolvesItsInnerClassFromTheFullArchive() throws Exception {
+        Path source = temp.resolve("Outer.java");
+        Files.writeString(source, "public class Outer { public static class Inner { public int value() { return 42; } } }");
+        assertEquals(0, javax.tools.ToolProvider.getSystemJavaCompiler().run(null, null, null, "-proc:none", "--release", "21",
+                "-d", temp.toString(), source.toString()));
+        Path full = Fixtures.jar(temp.resolve("full archive.jar"), Map.of(
+                "Outer.class", Files.readAllBytes(temp.resolve("Outer.class")),
+                "Outer$Inner.class", Files.readAllBytes(temp.resolve("Outer$Inner.class")),
+                "Other.class", Fixtures.marker("Other", 8)));
+        Path targets = temp.resolve("target classes.jar");
+        assertTrue(Exports.subset(full, targets, java.util.Set.of("Outer.class")));
+        Path output = Files.createDirectory(temp.resolve("targeted sources"));
+        Path diagnostics = temp.resolve("targeted.tsv");
+        var result = runMain(DecompilerWorker.class, "cfr", targets.toString(), output.toString(), diagnostics.toString(), "21", full.toString());
+        assertEquals(0, result.code, () -> result.log + diagnostics(diagnostics));
+        assertFalse(Files.exists(output.resolve("Other.java")));
+        assertTrue(Files.readString(output.resolve("Outer.java")).contains("class Inner"));
     }
 
     @Test
@@ -98,6 +120,8 @@ class CliTest {
         Path sources = Files.createDirectory(temp.resolve("sources"));
         Files.writeString(sources.resolve("Broken.java"), """
                 import fixture.unavailable.Api;
+                import org.bukkit.World;
+                import io.papermc.paper.threadedregions.scheduler.RegionScheduler;
                 class Broken {
                     Api api;
                     int invalid = "text";
@@ -109,6 +133,9 @@ class CliTest {
         String details = Files.readString(output.resolve("javac-provided.tsv"));
         assertTrue(details.contains("missing-dependency\tBroken.java\tcompiler.err.doesnt.exist"), details);
         assertTrue(details.contains("compilation\tBroken.java\tcompiler.err.prob.found.req"), details);
+        assertTrue(details.contains("package fixture.unavailable"), details);
+        assertTrue(details.contains("matching Bukkit, Spigot or Paper API"), details);
+        assertTrue(details.contains("matching Paper or Folia API"), details);
     }
 
     @Test
@@ -153,11 +180,15 @@ class CliTest {
     }
 
     private Result run(String... arguments) throws Exception {
+        return runMain(Main.class, arguments);
+    }
+
+    private Result runMain(Class<?> main, String... arguments) throws Exception {
         Path executable = Path.of(System.getProperty("java.home"), "bin",
                 java.io.File.separatorChar == '\\' ? "java.exe" : "java");
         var command = new ArrayList<>(List.of(executable.toString(), "-Xmx768m", "-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8",
                 "-cp", System.getProperty("jdx.testClasspath"),
-                Main.class.getName()));
+                main.getName()));
         command.addAll(Arrays.asList(arguments));
         Path log = Files.createTempFile(temp, "cli-", ".log");
         var process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(log.toFile()).start();

@@ -17,11 +17,13 @@ import org.objectweb.asm.util.CheckClassAdapter;
 
 import java.util.Map;
 import java.util.HashMap;
+import java.util.List;
 import java.util.TreeMap;
 
 final class Bytecode {
     private static final int PASSES = 6;
-    record Result(byte[] bytes, Map<String, Integer> changes, String rollback) {}
+    record Result(byte[] bytes, Map<String, Integer> changes, String rollback,
+                  StringRecovery.Counts strings, List<String> stringSites) {}
     private record MethodKey(String name, String descriptor) {}
 
     static ClassNode parse(byte[] bytes) {
@@ -80,26 +82,30 @@ final class Bytecode {
         try {
             return transform(original, parse(original), hierarchy);
         } catch (RuntimeException | StackOverflowError failure) {
-            return new Result(original, Map.of(), Inspection.failure(failure));
+            return new Result(original, Map.of(), Inspection.failure(failure), StringRecovery.Counts.EMPTY, List.of());
         }
     }
 
     static Result transform(byte[] original, ClassNode node, Hierarchy hierarchy) {
         var changes = new TreeMap<String, Integer>();
         byte[] verified = original;
+        String owner = node.name;
+        StringRecovery strings = null;
+        boolean stringsCommitted = false;
         try {
             // Keep custom attributes and legacy subroutines byte-for-byte.
             if (node.attrs != null || node.fields.stream().anyMatch(field -> field.attrs != null)
                     || node.methods.stream().anyMatch(method -> method.attrs != null)) {
-                return new Result(original, Map.of(), "Custom attributes");
+                return new Result(original, Map.of(), "Custom attributes", StringRecovery.Counts.EMPTY, List.of());
             }
             verify(node);
+            strings = new StringRecovery(node);
             boolean flow = (node.version & 0xffff) >= 51;
             for (int pass = 0; pass < PASSES; pass++) {
                 var replacements = new HashMap<MethodKey, MethodNode>();
                 var counts = new TreeMap<String, Integer>();
                 for (MethodNode method : node.methods) {
-                    var applied = Rewrites.apply(node.name, method, flow);
+                    var applied = Rewrites.apply(node.name, method, flow, pass == 0 ? strings : null);
                     if (!applied.isEmpty()) {
                         replacements.put(new MethodKey(method.name, method.desc), method);
                         applied.forEach((key, value) -> counts.merge(key, value, Integer::sum));
@@ -112,11 +118,14 @@ final class Bytecode {
                 node = parse(candidate);
                 verify(node);
                 verified = candidate;
+                stringsCommitted = true;
                 counts.forEach((key, value) -> changes.merge(key, value, Integer::sum));
             }
-            return new Result(verified, changes, null);
+            return new Result(verified, changes, null, strings.counts(stringsCommitted), strings.rows(owner, stringsCommitted));
         } catch (AnalyzerException | RuntimeException | StackOverflowError failure) {
-            return new Result(verified, changes, Inspection.failure(failure));
+            return new Result(verified, changes, Inspection.failure(failure),
+                    strings == null ? StringRecovery.Counts.EMPTY : strings.counts(stringsCommitted),
+                    strings == null ? List.of() : strings.rows(owner, stringsCommitted));
         }
     }
 

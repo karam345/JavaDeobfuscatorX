@@ -25,16 +25,16 @@ jobs:
       - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
       - name: Build and package on Unix
         if: runner.os != 'Windows'
-        run: ./gradlew --no-daemon clean build installDist skillZip
+        run: ./gradlew --no-daemon clean build installDist verifySkillZip
       - name: Build and package on Windows
         if: runner.os == 'Windows'
-        run: .\gradlew.bat --no-daemon clean build installDist skillZip
+        run: .\gradlew.bat --no-daemon clean build installDist verifySkillZip
       - name: Smoke-test the Unix launcher
         if: runner.os != 'Windows'
-        run: build/install/javadeobfuscatorx/bin/jdx help
+        run: build/verified-skill/java-deobfuscation/runtime/bin/jdx help
       - name: Smoke-test the Windows launcher
         if: runner.os == 'Windows'
-        run: .\build\install\javadeobfuscatorx\bin\jdx.bat help
+        run: .\build\verified-skill\java-deobfuscation\runtime\bin\jdx.bat help
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:

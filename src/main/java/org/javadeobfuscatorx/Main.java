@@ -135,6 +135,9 @@ public final class Main {
         Exports.table(destination.resolve("minecraft.tsv"), "descriptor\tkey\tvalue", inspection.minecraft.metadata);
         Exports.table(destination.resolve("mappings.tsv"), "kind\tclass\tmember\tdescriptor\tsuggestion\tconfidence", inspection.names);
         Exports.table(destination.resolve("references.tsv"), "from_class\tto_class", inspection.references);
+        Exports.table(destination.resolve("hierarchy.tsv"), "class\trelation\tparent", inspection.hierarchy);
+        Exports.table(destination.resolve("calls.tsv"), "class\tmethod\tdescriptor\tdispatch\ttarget_owner\ttarget_method\ttarget_descriptor",
+                inspection.calls);
         Exports.table(destination.resolve("strings.tsv"), "class\tmethod\tdescriptor\tcodec\ttext", inspection.strings);
         Exports.table(destination.resolve("bootstraps.tsv"),
                 "class\tmethod\tdescriptor\tkind\tname\tcall_descriptor\tbootstrap_owner\tbootstrap_name"

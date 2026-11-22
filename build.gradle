@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'org.javadeobfuscatorx'
-version = '0.2.0'
+version = '0.3.0'
 
 repositories {
     mavenCentral()
@@ -47,6 +47,7 @@ distributions {
         contents {
             from('LICENSE', 'THIRD_PARTY.md')
             from('licenses') { into 'licenses' }
+            from('assets') { into 'assets' }
         }
     }
 }
@@ -70,6 +71,33 @@ tasks.register('skillZip', Zip) {
     into('java-deobfuscation') {
         from('skills/java-deobfuscation')
         from('LICENSE')
-        into('runtime') { from(installDist.destinationDir) }
+        from('assets') { into 'assets' }
+        into('runtime') {
+            from(installDist.destinationDir) {
+                exclude 'assets/**'
+                filesMatching('bin/jdx') { permissions { unix('755') } }
+            }
+        }
+    }
+}
+
+def engineJarName = tasks.named('jar', Jar).flatMap { it.archiveFileName }
+tasks.register('verifySkillZip', Sync) {
+    dependsOn skillZip
+    from { zipTree(skillZip.archiveFile.get().asFile) }
+    into layout.buildDirectory.dir('verified-skill')
+    doLast {
+        def skill = new File(destinationDir, 'java-deobfuscation')
+        def metadata = new File(skill, 'agents/openai.yaml').getText('UTF-8')
+        ['icon_small', 'icon_large'].each { key ->
+            def match = metadata =~ /(?m)^  ${key}: "\.\/([^"\r\n]+)"$/
+            if (!match.find() || !new File(skill, match.group(1)).isFile()) {
+                throw new GradleException("Missing packaged skill asset for ${key}")
+            }
+        }
+        ['SKILL.md', 'runtime/bin/jdx', 'runtime/bin/jdx.bat',
+         "runtime/lib/${engineJarName.get()}", 'runtime/licenses/ASM.txt'].each { path ->
+            if (!new File(skill, path).isFile()) throw new GradleException("Missing packaged skill file ${path}")
+        }
     }
 }

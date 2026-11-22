@@ -22,7 +22,7 @@ import java.util.Map;
 import java.util.TreeMap;
 
 final class Rewrites implements Opcodes {
-    static Map<String, Integer> apply(String owner, MethodNode method, boolean flow) throws AnalyzerException {
+    static Map<String, Integer> apply(String owner, MethodNode method, boolean flow, StringRecovery strings) throws AnalyzerException {
         var counts = new TreeMap<String, Integer>();
         var code = method.instructions;
         if (code.size() == 0) return counts;
@@ -31,19 +31,25 @@ final class Rewrites implements Opcodes {
             if (insn.getOpcode() == JSR || insn.getOpcode() == RET) return counts;
         }
         Bytecode.checkBudget(method);
-        Frame<ConstantFlow.Fact>[] frames = new Analyzer<>(new ConstantFlow()).analyze(owner, method);
+        Frame<ConstantFlow.Fact>[] frames = new Analyzer<>(new ConstantFlow(strings)).analyze(owner, method);
 
         // Apply facts against the original graph. Only remove adjacent producers if they are still literal.
+        boolean reachabilityChanged = false;
         for (int i = 0; i < initial.length; i++) {
             var insn = initial[i];
             var frame = frames[i];
-            if (frame == null || insn.getOpcode() < 0 || annotated(insn)) continue;
-            String change = Strings.rewrite(code, insn) ? "literal string decoder" : simplify(code, insn, frame, flow);
-            if (change != null) counts.merge(change, 1, Integer::sum);
+            if (insn.getOpcode() < 0) continue;
+            if (frame == null) reachabilityChanged = true;
+            String change = strings == null ? null : strings.apply(method, insn, frame, i);
+            if (change == null && frame != null && !annotated(insn)) change = simplify(code, insn, frame, flow);
+            if (change != null) {
+                counts.merge(change, 1, Integer::sum);
+                reachabilityChanged |= insn instanceof JumpInsnNode || insn instanceof TableSwitchInsnNode || insn instanceof LookupSwitchInsnNode;
+            }
         }
         int handlers = removeShadowedHandlers(method);
         if (handlers != 0) counts.put("shadowed exception handler", handlers);
-        if (flow) normalize(owner, method, counts);
+        if (flow) normalize(owner, method, counts, reachabilityChanged || handlers != 0);
         int names = Identifiers.normalizeLocals(method);
         if (names != 0) counts.put("local debug identifier", names);
         return counts;
@@ -51,6 +57,16 @@ final class Rewrites implements Opcodes {
 
     private static String simplify(InsnList code, AbstractInsnNode insn, Frame<ConstantFlow.Fact> frame, boolean flow) {
         int opcode = insn.getOpcode();
+        if (flow && insn instanceof JumpInsnNode jump && opcode == GOTO
+                && executable(jump.label) instanceof VarInsnNode load && load.getOpcode() == ILOAD
+                && frame.getLocal(load.var).number() instanceof Integer key) {
+            var dispatch = executable(load.getNext());
+            LabelNode target = switchTarget(dispatch, key);
+            if (target != null && executable(target) != load) {
+                jump.label = target;
+                return "constant dispatcher jump";
+            }
+        }
         if (insn instanceof VarInsnNode local && (opcode == ILOAD || opcode == LLOAD)) {
             Number value = frame.getLocal(local.var).number();
             if (value != null) {
@@ -186,7 +202,7 @@ final class Rewrites implements Opcodes {
         return null;
     }
 
-    private static boolean matches(int compare, int condition) {
+    static boolean matches(int compare, int condition) {
         return switch (condition) {
             case 0 -> compare == 0;
             case 1 -> compare != 0;
@@ -207,7 +223,7 @@ final class Rewrites implements Opcodes {
         return null;
     }
 
-    private static AbstractInsnNode push(Number value) {
+    static AbstractInsnNode push(Number value) {
         if (value instanceof Long wide) {
             return wide == 0 || wide == 1 ? new InsnNode(LCONST_0 + wide.intValue()) : new LdcInsnNode(wide);
         }
@@ -258,7 +274,8 @@ final class Rewrites implements Opcodes {
         return before - method.tryCatchBlocks.size();
     }
 
-    private static void normalize(String owner, MethodNode method, Map<String, Integer> counts) throws AnalyzerException {
+    private static void normalize(String owner, MethodNode method, Map<String, Integer> counts,
+                                  boolean reachabilityChanged) throws AnalyzerException {
         var code = method.instructions;
         for (var insn : code.toArray()) {
             if (!(insn instanceof JumpInsnNode jump) || annotated(jump) || jump.getOpcode() == JSR) continue;
@@ -269,9 +286,12 @@ final class Rewrites implements Opcodes {
             } else if (target != jump.label) {
                 jump.label = target;
                 counts.merge("threaded jump", 1, Integer::sum);
+                reachabilityChanged = true;
             }
         }
 
+        // The original frames already cover every instruction when no edge or handler was removed.
+        if (!reachabilityChanged) return;
         var frames = Bytecode.frames(owner, method);
         var nodes = code.toArray();
         var liveBefore = new IdentityHashMap<LabelNode, Integer>();
@@ -313,7 +333,7 @@ final class Rewrites implements Opcodes {
         return node;
     }
 
-    private static boolean annotated(AbstractInsnNode instruction) {
+    static boolean annotated(AbstractInsnNode instruction) {
         return instruction.visibleTypeAnnotations != null || instruction.invisibleTypeAnnotations != null;
     }
 }

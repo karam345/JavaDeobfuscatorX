@@ -14,7 +14,7 @@ import org.objectweb.asm.tree.analysis.Value;
 import java.util.List;
 
 final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcodes {
-    record Fact(BasicValue type, Number number) implements Value {
+    record Fact(BasicValue type, Object constant) implements Value {
         @Override
         public int getSize() {
             return type.getSize();
@@ -23,12 +23,18 @@ final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcod
         boolean isNull() {
             return BasicInterpreter.NULL_TYPE.equals(type.getType());
         }
+
+        Number number() {
+            return constant instanceof Number value ? value : null;
+        }
     }
 
     private final BasicInterpreter basic = new BasicInterpreter();
+    private final StringRecovery strings;
 
-    ConstantFlow() {
+    ConstantFlow(StringRecovery strings) {
         super(ASM9);
+        this.strings = strings;
     }
 
     @Override
@@ -39,11 +45,12 @@ final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcod
     @Override
     public Fact newOperation(AbstractInsnNode insn) throws AnalyzerException {
         if (insn.getOpcode() == ACONST_NULL) return new Fact(new BasicValue(BasicInterpreter.NULL_TYPE), null);
-        Number value = Rewrites.integer(insn);
+        Object value = Rewrites.integer(insn);
         if (insn.getOpcode() == LCONST_0 || insn.getOpcode() == LCONST_1) {
             value = (long) (insn.getOpcode() - LCONST_0);
-        } else if (insn instanceof LdcInsnNode load && load.cst instanceof Long literal) {
-            value = literal;
+        } else if (insn instanceof LdcInsnNode load) {
+            if (load.cst instanceof Long literal) value = literal;
+            if (strings != null && load.cst instanceof String text && text.length() <= Strings.LIMIT) value = text;
         }
         return fact(basic.newOperation(insn), value);
     }
@@ -71,7 +78,9 @@ final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcod
 
     @Override
     public Fact naryOperation(AbstractInsnNode insn, List<? extends Fact> values) throws AnalyzerException {
-        return fact(basic.naryOperation(insn, values.stream().map(Fact::type).toList()), null);
+        BasicValue type = basic.naryOperation(insn, values.stream().map(Fact::type).toList());
+        Object text = strings == null ? null : strings.infer(insn, values);
+        return fact(type, text);
     }
 
     @Override
@@ -86,7 +95,7 @@ final class ConstantFlow extends Interpreter<ConstantFlow.Fact> implements Opcod
         return fact(basic.merge(left.type(), right.type()), null);
     }
 
-    private static Fact fact(BasicValue type, Number value) {
+    private static Fact fact(BasicValue type, Object value) {
         return type == null ? null : new Fact(type, value);
     }
 

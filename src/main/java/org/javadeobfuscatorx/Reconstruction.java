@@ -26,7 +26,18 @@ final class Reconstruction {
         progress.println("Preserving archive resources");
         Exports.resources(archive, destination.resolve("resources.zip"));
         staged.changes().forEach((pattern, count) -> report.add("  Applied " + pattern + ": " + count));
-        if (rewrite) report.add("Rewrite skips or rollbacks: " + staged.rollbacks().size());
+        if (rewrite) {
+            var strings = staged.strings();
+            report.add("Rewrite skips or rollbacks: " + staged.rollbacks().size());
+            report.add("String candidates detected: " + strings.detected());
+            report.add("String candidates decoded: " + strings.decoded());
+            report.add("Verified string replacements: " + strings.replaced());
+            report.add("String candidates skipped: " + strings.skipped());
+            report.add("String candidates failed or rolled back: " + strings.failed());
+            if (staged.stringSites().size() < strings.detected()) report.add("String site diagnostics truncated");
+            Exports.table(destination.resolve("string-rewrites.tsv"), "class\tmethod\tdescriptor\tinstruction\tstatus\tdetail\ttext",
+                    staged.stringSites());
+        }
         Exports.table(destination.resolve("rewrite-issues.tsv"), "class\treason", staged.rollbacks());
         if (staged.classes() == 0) {
             report.add("Decompilation skipped: no parseable classes in the selected view");
@@ -51,7 +62,27 @@ final class Reconstruction {
         boolean partial = primary.partial(options.compile);
         if (compare || options.engine.equals("auto") && (primary.backendCode != 0 || primary.quality.recoveryNeeded())) {
             Path cfrPath = destination.resolve("cfr");
-            second = decompile(options, "cfr", "cfr", stage, cfrPath, expected, destination, work, libraries,
+            Path cfrInput = stage;
+            List<Path> cfrLibraries = libraries;
+            var cfrExpected = expected;
+            var needed = primary.quality.recoveryUnits(expected.keySet());
+            if (!compare && !options.compile && !needed.isEmpty() && needed.size() < expected.size()) {
+                var roots = new TreeSet<String>();
+                var subset = new java.util.TreeMap<String, Set<String>>();
+                for (String name : needed) {
+                    roots.add(name.substring(0, name.length() - ".java".length()) + ".class");
+                    subset.put(name, expected.get(name));
+                }
+                Path targets = work.resolve("cfr-targets.jar");
+                if (Exports.subset(stage, targets, roots)) {
+                    cfrInput = targets;
+                    cfrLibraries = new ArrayList<>(libraries);
+                    cfrLibraries.addFirst(stage);
+                    cfrExpected = subset;
+                    report.add("Targeted CFR fallback for " + needed.size() + " source units");
+                }
+            }
+            second = decompile(options, "cfr", "cfr", cfrInput, cfrPath, cfrExpected, destination, work, cfrLibraries,
                     release, report, progress);
             Map<String, Path> original = selection;
             selection = SourceQuality.select(primary.quality, second.quality, expected.keySet(), options.compile);
@@ -67,6 +98,8 @@ final class Reconstruction {
                         && verified.syntaxErrors <= primary.quality.syntaxErrors
                         && verified.placeholders <= primary.quality.placeholders
                         && verified.compilationErrors <= primary.quality.compilationErrors
+                        && verified.unresolved <= primary.quality.unresolved
+                        && verified.missingDependencies <= primary.quality.missingDependencies
                         && (!primary.quality.checked || verified.checked)
                         && (!primary.quality.compiled || verified.compiled);
                 if (acceptable) {
@@ -154,7 +187,7 @@ final class Reconstruction {
             String backend = chosen == null ? "" : chosen.startsWith(primary.path) ? primaryName : "cfr";
             rows.add(Inspection.row(name, expected.contains(name) ? "expected" : "additional",
                     first == null ? "missing source" : first.issue(),
-                    secondary == null ? "not attempted" : second == null ? "missing source" : second.issue(), backend));
+                    second == null ? "not attempted" : second.issue(), backend));
         }
         Exports.table(file, "source\tinventory\t" + primaryName + "\t"
                 + (secondary == null ? "alternate" : "cfr") + "\tselected", rows);

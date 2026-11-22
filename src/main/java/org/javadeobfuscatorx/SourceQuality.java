@@ -96,6 +96,15 @@ final class SourceQuality {
         return !checked || missing != 0 || syntaxErrors != 0 || placeholders != 0 || compilationErrors != 0 || unresolved != 0;
     }
 
+    Set<String> recoveryUnits(Set<String> expected) {
+        var needed = new TreeSet<String>();
+        for (String name : expected) {
+            var unit = units.get(name);
+            if (unit == null || unit.path == null || unit.missingDeclarations != 0 || unit.syntax || unit.stub) needed.add(name);
+        }
+        return needed;
+    }
+
     String summary() {
         return missing + " incomplete source units, " + syntaxErrors + " with syntax errors, "
                 + placeholders + " with decompiler failure markers, " + compilationErrors + " with compilation errors, "

@@ -50,6 +50,7 @@ final class SourceValidation {
         if (modular) options.addAll(List.of("--module-path", libraries));
         if (parseOnly && Math.min(release, runtime) == runtime) options.add("--enable-preview");
         var diagnosticSites = new TreeSet<String>();
+        var dependencyHints = new TreeSet<String>();
         try (var manager = compiler.getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8)) {
             var task = (JavacTask) compiler.getTask(null, manager, diagnostic -> {
                 if (diagnostic.getKind() != Diagnostic.Kind.ERROR) return;
@@ -58,9 +59,15 @@ final class SourceValidation {
                 String code = diagnostic.getCode();
                 String message = diagnostic.getMessage(Locale.ROOT);
                 String category = parseOnly ? "syntax" : classify(code, message);
-                String site = Inspection.row(category, path, code);
+                String site = Inspection.row(category, path, code, Long.toString(diagnostic.getLineNumber()), message);
                 if (diagnosticSites.size() < 4000 && diagnosticSites.add(site)) {
-                    messages.add(site + "\t" + Inspection.row(Long.toString(diagnostic.getLineNumber()), message));
+                    messages.add(site);
+                    if (category.equals("missing-dependency")) {
+                        String hint = Minecraft.dependencyHint(message);
+                        if (hint != null && dependencyHints.add(hint)) {
+                            messages.add(Inspection.row("dependency-hint", path, "minecraft-api", "", hint));
+                        }
+                    }
                 }
             }, options, null, manager.getJavaFileObjectsFromPaths(paths));
             if (!parseOnly) return task.call();
